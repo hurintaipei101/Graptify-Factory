@@ -1,0 +1,31 @@
+name: GitHub Evidence Smoke
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  read-evidence:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.repository == 'hurintaipei101/Graptify-Factory'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      checks: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+          package-manager-cache: false
+
+      - name: Read PR #4 evidence
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node factory/github-evidence-smoke.mjs

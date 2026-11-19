@@ -73,10 +73,7 @@ export async function inspectGitHubChecks({ repository, revision, requiredChecks
       continue;
     }
     if (check.head_sha !== revision) return result('BLOCKED', { reason: 'GitHub check run is for a different SHA' });
-    if (read && (!Number.isSafeInteger(check.id) || check.id < 1 || check.app?.id !== 15368 ||
-        check.app?.slug !== 'github-actions' || typeof check.url !== 'string' || check.url.toLowerCase() !==
-        `https://api.github.com/repos/${repository}/check-runs/${check.id}`.toLowerCase() ||
-        checks.some(({ id }) => id === check.id))) {
+    if (read && (!hasGitHubActionsProvenance(check, repository) || checks.some(({ id }) => id === check.id))) {
       return result('BLOCKED', { reason: 'required check run has unverified GitHub Actions provenance' });
     }
     if (['queued', 'in_progress', 'pending', 'requested', 'waiting'].includes(check.status)) {
@@ -99,6 +96,12 @@ export async function inspectGitHubChecks({ repository, revision, requiredChecks
   if (findings.length > 0) return result('FAIL', { ...metadata, findings });
   if (missing.length) return result('PENDING', { ...metadata, reason: 'required GitHub check runs are missing' });
   return result(pending ? 'PENDING' : 'PASS', metadata);
+}
+
+export function hasGitHubActionsProvenance(check, repository) {
+  return Number.isSafeInteger(check.id) && check.id > 0 && check.app?.id === 15368 &&
+    check.app?.slug === 'github-actions' && typeof check.url === 'string' &&
+    check.url.toLowerCase() === `https://api.github.com/repos/${repository}/check-runs/${check.id}`.toLowerCase();
 }
 
 export function isFreshGitHubTimestamp(value, nowMs) {
