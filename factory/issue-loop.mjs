@@ -16,8 +16,9 @@ const PROFILE_FIELDS = [
   'schema_version', 'issue_key', 'linear_issue_id', 'project', 'module',
   'architecture_revision', 'dependencies', 'role_profile', 'model',
   'allowed_environments', 'forbidden_operations', 'max_repair_cycles',
-  'requirements', 'acceptance_tests', 'merge_policy', 'release_policy',
+  'requirements', 'acceptance_tests', 'memory_scope', 'merge_policy', 'release_policy',
 ];
+const MEMORY_SCOPE_FIELDS = ['short_term', 'long_term', 'allow_customer_data'];
 const hash = (values) => createHash('sha256').update(JSON.stringify(values)).digest('hex');
 const shortText = (value, max = 128) => typeof value === 'string' && value.trim().length > 0 && value.length <= max;
 const shortList = (value, min = 0, maxLength = 128) => Array.isArray(value) &&
@@ -26,7 +27,18 @@ const shortList = (value, min = 0, maxLength = 128) => Array.isArray(value) &&
 
 /** Bind operator approval to every profile field consumed by the loop. */
 export function issueProfileDigest(profile) {
-  return hash(PROFILE_FIELDS.map((key) => profile?.[key] ?? null));
+  return hash(PROFILE_FIELDS.map((key) => key === 'memory_scope'
+    ? MEMORY_SCOPE_FIELDS.map((field) => profile?.memory_scope?.[field] ?? null)
+    : profile?.[key] ?? null));
+}
+
+function validMemoryScope(scope) {
+  if (!scope || typeof scope !== 'object' || Array.isArray(scope)) return false;
+  const fields = Object.keys(scope);
+  return fields.length === MEMORY_SCOPE_FIELDS.length &&
+    MEMORY_SCOPE_FIELDS.every((field) => fields.includes(field)) &&
+    shortText(scope.short_term) && shortText(scope.long_term) &&
+    typeof scope.allow_customer_data === 'boolean';
 }
 
 function approvedProfile(profile, approval) {
@@ -39,6 +51,7 @@ function approvedProfile(profile, approval) {
     shortList(profile.allowed_environments, 1) && profile.allowed_environments.every((name) => ENVIRONMENTS.has(name)) &&
     shortList(profile.forbidden_operations) && shortList(profile.requirements, 1, 512) &&
     shortList(profile.acceptance_tests, 1) && profile.max_repair_cycles === MAX_REPAIR_CYCLES &&
+    validMemoryScope(profile.memory_scope) &&
     shortText(profile.merge_policy) && shortText(profile.release_policy) &&
     approval?.approved === true && approval.profileDigest === issueProfileDigest(profile) &&
     typeof approval.repository === 'string' && REPOSITORY.test(approval.repository) &&
@@ -226,7 +239,7 @@ export async function runIssueLoop({
               issueKey: report.issue_key, repository: approval.repository, runId: report.run_id, cycle,
               baseRevision: report.revision ?? approval.baseline, model: profile.model,
               requirements: profile.requirements, acceptanceTests: profile.acceptance_tests,
-              forbiddenOperations: profile.forbidden_operations, findings,
+              forbiddenOperations: profile.forbidden_operations, memoryScope: profile.memory_scope, findings,
             }, budget);
             if (coded?.status === 'GATE_A') return { status: 'GATE_A', reason: 'coding reported a scope, security or permission boundary' };
             if (coded?.status !== 'PASS' || typeof coded.revision !== 'string' ||

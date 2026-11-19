@@ -79,6 +79,7 @@ test('runs targeted test, CI and independent review repairs and replays persiste
   assert.deepEqual(prompts.map(({ baseRevision }) => baseRevision), [baseline, ...[0, 1, 2].map(candidate)]);
   assert.deepEqual(prompts.flatMap(({ findings }) => findings.map(({ stage, id }) => [stage, id])),
     [['tests', 'T01'], ['ci', check], ['review', 'task.mjs:12']]);
+  assert.deepEqual(prompts.map(({ memoryScope }) => memoryScope), Array(4).fill(options.profile.memory_scope));
   assert.equal(report.checks.find(({ stage }) => stage === 'ci').reads, 2);
   assert.equal(reads, 4);
   assert.deepEqual(await runIssueLoop({ ...options, providers: {}, evidence: {} }), report);
@@ -158,6 +159,56 @@ test('admission rejects changed profile, unavailable dependencies, same reviewer
       if (scenario === 'live') assert.match(report.next_action, /verified write isolation/);
     });
   }
+});
+
+test('changing allow_customer_data invalidates approval before coding dispatch', async (t) => {
+  const options = await fixture(t);
+  options.profile.memory_scope.allow_customer_data = true;
+  assert.notEqual(issueProfileDigest(options.profile), options.approval.profileDigest);
+  let calls = 0;
+  options.providers.coding.run = () => { calls += 1; };
+
+  const report = await runIssueLoop(options);
+  assert.equal(report.status, 'BLOCKED');
+  assert.match(report.next_action, /invalid issue profile approval/);
+  assert.equal(calls, 0);
+});
+
+test('malformed memory scopes block dispatch even with a matching digest', async (t) => {
+  for (const memoryScope of [
+    undefined,
+    { short_term: 'issue', long_term: 'project/module' },
+    { short_term: 'issue', long_term: 'project/module', allow_customer_data: 'false' },
+    { short_term: '', long_term: 'project/module', allow_customer_data: false },
+    { short_term: 'issue', long_term: [], allow_customer_data: false },
+  ]) {
+    const options = await fixture(t);
+    options.profile.memory_scope = memoryScope;
+    options.approval.profileDigest = issueProfileDigest(options.profile);
+    let calls = 0;
+    options.providers.coding.run = () => { calls += 1; };
+
+    const report = await runIssueLoop(options);
+    assert.equal(report.status, 'BLOCKED');
+    assert.match(report.next_action, /invalid issue profile approval/);
+    assert.equal(calls, 0);
+  }
+});
+
+test('coding receives the explicitly approved customer-data policy', async (t) => {
+  const options = await fixture(t);
+  options.profile.memory_scope.allow_customer_data = true;
+  options.approval.profileDigest = issueProfileDigest(options.profile);
+  const { short_term, long_term } = options.profile.memory_scope;
+  options.profile.memory_scope = { allow_customer_data: true, long_term, short_term };
+  let suppliedScope;
+  options.providers.coding.run = ({ memoryScope }) => {
+    suppliedScope = memoryScope;
+    return { status: 'PASS', revision: candidate(0) };
+  };
+
+  assert.equal((await runIssueLoop(options)).status, 'READY');
+  assert.deepEqual(suppliedScope, options.profile.memory_scope);
 });
 
 test('an explicit provider boundary stops at Gate A without a retry', async (t) => {
