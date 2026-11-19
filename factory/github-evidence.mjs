@@ -1,4 +1,4 @@
-import { inspectGitHubChecks, isFreshGitHubTimestamp } from './evidence-adapter.mjs';
+import { hasGitHubActionsProvenance, inspectGitHubChecks, isFreshGitHubTimestamp } from './evidence-adapter.mjs';
 
 const API = 'https://api.github.com/';
 const CODEX = 'chatgpt-codex-connector';
@@ -33,6 +33,14 @@ const sameRepo = (actual, expected) => typeof actual === 'string' && actual.toLo
 const isCodex = (author) => author?.login === CODEX && author.__typename === 'Bot';
 const fullConnection = (value) => value?.pageInfo?.hasNextPage === false && Array.isArray(value.nodes) && value.nodes.length <= 100;
 const states = new Set(['APPROVED', 'CHANGES_REQUESTED', 'COMMENTED', 'DISMISSED', 'PENDING']);
+const validRepository = (value) => typeof value === 'string' && /^[\w.-]{1,100}\/[\w.-]{1,100}$/.test(value) &&
+  value.split('/').every((part) => part !== '.' && part !== '..');
+const validPullRequest = (value) => Number.isInteger(value) && value >= 1 && value <= 2_147_483_647;
+
+function findingSeverity(body) {
+  if (typeof body !== 'string' || !body.trimEnd().endsWith('<!-- codex-code-review-finding:v1 -->')) return;
+  return /^\*\*<sub><sub>!\[(P[0-3]) Badge\]\(https:\/\/img\.shields\.io\/badge\/\1-[a-z]+\?style=flat\)<\/sub><\/sub>/.exec(body)?.[1];
+}
 
 function verifyReview(pr, revision, nowMs) {
   const blocked = (reason, details) => ({ status: 'BLOCKED', reason, details });
@@ -79,8 +87,8 @@ function verifyReview(pr, revision, nowMs) {
         !isFreshGitHubTimestamp(comment.createdAt, nowMs) || comment.updatedAt !== comment.createdAt) {
       return blocked('Codex review comment has mismatched or unverifiable provenance', details);
     }
-    const severity = /^\*\*<sub><sub>!\[(P[0-3]) Badge\]\(https:\/\/img\.shields\.io\/badge\/\1-[a-z]+\?style=flat\)<\/sub><\/sub>/.exec(comment.body)?.[1];
-    if (!severity || !comment.body.trimEnd().endsWith('<!-- codex-code-review-finding:v1 -->')) {
+    const severity = findingSeverity(comment.body);
+    if (!severity) {
       return blocked('Codex finding format is unrecognized', details);
     }
     if (thread.isResolved || !['P0', 'P1'].includes(severity)) continue;
@@ -93,8 +101,7 @@ function verifyReview(pr, revision, nowMs) {
   return { status: 'PASS', details };
 }
 
-/** Use the Actions job token on GitHub.com. An injected API transport is always simulated. */
-export function createGitHubEvidenceProviders({ pullRequest, fetchImpl } = {}) {
+function createGitHubEvidenceClient(fetchImpl) {
   const mode = fetchImpl === undefined ? 'LIVE' : 'SIMULATION';
   const request = mode === 'LIVE' ? globalThis.fetch : fetchImpl;
   const source = mode === 'LIVE' ? 'github.com:read-only' : 'fixture:github-api';
@@ -133,16 +140,19 @@ export function createGitHubEvidenceProviders({ pullRequest, fetchImpl } = {}) {
       return { ok: false, reason: 'GitHub API response was unavailable or invalid' };
     }
   }
+  return { mode, source, read };
+}
 
+/** Use the Actions job token on GitHub.com. An injected API transport is always simulated. */
+export function createGitHubEvidenceProviders({ pullRequest, fetchImpl } = {}) {
+  const { mode, source, read } = createGitHubEvidenceClient(fetchImpl);
   function provider(kind, principal, inspect) {
     return {
       mode, kind, principal,
       async run(input, { signal } = {}) {
         const { repository, revision } = input;
         const options = { repository, signal };
-        if (typeof repository !== 'string' || !/^[\w.-]{1,100}\/[\w.-]{1,100}$/.test(repository) ||
-            repository.split('/').some((part) => part === '.' || part === '..') || !sha(revision) ||
-            !Number.isInteger(pullRequest) || pullRequest < 1 || pullRequest > 2_147_483_647) {
+        if (!validRepository(repository) || !sha(revision) || !validPullRequest(pullRequest)) {
           return { revision, status: 'BLOCKED', reason: 'invalid approved repository, PR number or candidate SHA' };
         }
         const { details, ...result } = await inspect(input, options);
@@ -184,4 +194,113 @@ export function createGitHubEvidenceProviders({ pullRequest, fetchImpl } = {}) {
     return verifyReview(pr, revision, Date.now());
   });
   return { ci, review };
+}
+
+/** Read historical evidence without producing an issue-loop verdict. */
+export async function observeMergedGitHubEvidence({
+  repository, pullRequest, revision, mergeCommit, requiredCheck, fetchImpl,
+} = {}) {
+  const { mode, source, read } = createGitHubEvidenceClient(fetchImpl);
+  const report = { mode, source, authorization: 'BLOCKED' };
+  const fail = (reason) => ({ ...report, evidence_read: 'BLOCKED', reason });
+  if (!validRepository(repository) || !validPullRequest(pullRequest) || !sha(revision) ||
+      !sha(mergeCommit) || revision === mergeCommit || typeof requiredCheck !== 'string' ||
+      !/^[\w .-]{1,128}$/.test(requiredCheck)) {
+    return fail('Invalid merged PR evidence target');
+  }
+  const now = new Date();
+  const validTimestamp = (value) => typeof value === 'string' &&
+    /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,3})?Z$/.test(value) && Date.parse(value) <= now.getTime();
+  const options = { repository };
+  const prResponse = await read(`repos/${repository}/pulls/${pullRequest}`, options);
+  if (!prResponse.ok) return fail(prResponse.reason);
+  const pr = prResponse.value;
+  if (!sameRepo(pr?.base?.repo?.full_name, repository) || !sameRepo(pr?.head?.repo?.full_name, repository) ||
+      pr.number !== pullRequest || pr.state !== 'closed' || pr.merged !== true || pr.base.ref !== 'main' ||
+      pr.head.sha !== revision || pr.merge_commit_sha !== mergeCommit || !validTimestamp(pr.merged_at)) {
+    return fail('GitHub merged PR does not match the repository, candidate and main merge');
+  }
+  Object.assign(report, {
+    repository, pull_request: pullRequest, candidate_sha: revision, merge_sha: mergeCommit, observed_at: now.toISOString(),
+  });
+
+  const [owner, name] = repository.split('/');
+  const [checks, graph] = await Promise.all([
+    read(`repos/${repository}/commits/${revision}/check-runs?filter=latest&per_page=100`, options),
+    read('graphql', { ...options, query: REVIEW_QUERY, variables: { owner, name, number: pullRequest } }),
+  ]);
+  if (!checks.ok) return fail(checks.reason);
+  const { check_runs: runs, total_count: count } = checks.value ?? {};
+  if (!Array.isArray(runs) || runs.length !== count || count > 100) {
+    return fail('GitHub check-run response is invalid or incomplete');
+  }
+  const matches = runs.filter((run) => run?.name === requiredCheck);
+  const [check] = matches;
+  if (matches.length !== 1 || check.head_sha !== revision || !hasGitHubActionsProvenance(check, repository) ||
+      check.status !== 'completed' || !['success', 'failure'].includes(check.conclusion) ||
+      !validTimestamp(check.completed_at)) {
+    return fail('Required GitHub Actions check is missing, incomplete or has unverified provenance');
+  }
+  report.ci = {
+    id: check.id, name: requiredCheck, app: 'github-actions', app_id: 15368,
+    conclusion: check.conclusion, completed_at: check.completed_at,
+  };
+
+  if (!graph.ok) return fail(graph.reason);
+  const repo = graph.value?.data?.repository;
+  const reviewed = repo?.pullRequest;
+  if (!sameRepo(repo?.nameWithOwner, repository) || !sameRepo(reviewed?.headRepository?.nameWithOwner, repository) ||
+      reviewed.number !== pullRequest || reviewed.state !== 'MERGED' || reviewed.headRefOid !== revision ||
+      !fullConnection(reviewed.reviews) || !fullConnection(reviewed.reviewThreads)) {
+    return fail('GitHub merged PR review response is mismatched, invalid or incomplete');
+  }
+  const reviews = new Map();
+  const reviewIds = new Set();
+  for (const item of reviewed.reviews.nodes) {
+    if (!id(item?.id) || reviewIds.has(item.id) || !states.has(item.state)) {
+      return fail('GitHub review response has invalid or duplicate entries');
+    }
+    reviewIds.add(item.id);
+    if (!isCodex(item.author)) continue;
+    if (!sha(item.commit?.oid) || !validTimestamp(item.submittedAt)) {
+      return fail('Codex review lacks a verifiable commit or submission time');
+    }
+    reviews.set(item.id, {
+      id: item.id, sha: item.commit.oid, state: item.state, submitted_at: item.submittedAt,
+    });
+  }
+  if (reviews.size === 0) return fail('No trusted Codex review was found on the merged PR');
+  const findings = [];
+  const threadIds = new Set();
+  const commentIds = new Set();
+  for (const thread of reviewed.reviewThreads.nodes) {
+    const roots = thread?.comments?.nodes;
+    const comment = Array.isArray(roots) && roots.length === 1 ? roots[0] : null;
+    if (!id(thread?.id) || threadIds.has(thread.id) || typeof thread.isResolved !== 'boolean' ||
+        !id(comment?.id) || commentIds.has(comment.id)) {
+      return fail('GitHub review thread lacks a unique root comment or resolution state');
+    }
+    threadIds.add(thread.id);
+    commentIds.add(comment.id);
+    const review = reviews.get(comment.pullRequestReview?.id);
+    if (!review && !isCodex(comment.author)) continue;
+    const severity = findingSeverity(comment.body);
+    if (!review || !isCodex(comment.author) || comment.originalCommit?.oid !== review.sha ||
+        !validTimestamp(comment.createdAt) || comment.updatedAt !== comment.createdAt || !severity) {
+      return fail('Codex finding has invalid format or unverified review and SHA provenance');
+    }
+    findings.push({
+      thread_id: thread.id, comment_id: comment.id, review_id: review.id,
+      sha: review.sha, severity, resolved: thread.isResolved,
+    });
+  }
+  const observedReviews = [...reviews.values()];
+  return {
+    ...report, evidence_read: 'PASS',
+    review: {
+      author: CODEX, reviews: observedReviews, findings,
+      candidate_reviews: observedReviews.filter((review) => review.sha === revision).length,
+      candidate_findings: findings.filter((finding) => finding.sha === revision).length,
+    },
+  };
 }
