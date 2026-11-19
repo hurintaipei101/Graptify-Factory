@@ -2,6 +2,7 @@ import { evaluateIssue } from './controller.mjs';
 import { execFile } from 'node:child_process';
 
 const SHA = /^[0-9a-f]{40,64}$/i;
+export const GITHUB_EVIDENCE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
 export class EvidenceAdapterError extends Error {
   constructor(message) { super(message); this.name = 'EvidenceAdapterError'; }
@@ -39,7 +40,7 @@ function ghRead(execCommand, endpoint) {
 function defaultGh(args, callback) { execFile('gh', args, { encoding: 'utf8', windowsHide: true }, callback); }
 
 /** Read the latest exact-revision GitHub check runs without AI or write access. */
-export async function inspectGitHubChecks({ repository, revision, requiredChecks, signal, execCommand } = {}) {
+export async function inspectGitHubChecks({ repository, revision, requiredChecks, signal, execCommand, read } = {}) {
   const result = (status, extras) => ({ revision, status, ...extras });
   if (typeof repository !== 'string' || !/^[\w.-]+\/[\w.-]+$/.test(repository) ||
       repository.split('/').some((part) => part === '.' || part === '..') ||
@@ -48,28 +49,62 @@ export async function inspectGitHubChecks({ repository, revision, requiredChecks
       [...requiredChecks].some((name) => typeof name !== 'string' || !name || name.length > 128) || signal?.aborted) {
     return result('BLOCKED');
   }
-  const read = execCommand ?? ((args, callback) => execFile('gh', args, {
+  const command = execCommand ?? ((args, callback) => execFile('gh', args, {
     encoding: 'utf8', windowsHide: true, timeout: 10_000, maxBuffer: 262_144, killSignal: 'SIGKILL', signal,
   }, callback));
-  const response = await ghRead(read, `${GH_ENDPOINTS.checks(repository, revision)}?filter=latest&per_page=100`);
+  const endpoint = `${GH_ENDPOINTS.checks(repository, revision)}?filter=latest&per_page=100`;
+  const response = read ? await read(endpoint) : await ghRead(command, endpoint);
+  const nowMs = Date.now();
   const { check_runs: runs, total_count: count } = response.value ?? {};
-  if (!response.ok || !Array.isArray(runs) || count !== runs.length || signal?.aborted) return result('BLOCKED');
+  if (!response.ok) return result('BLOCKED', { reason: response.reason });
+  if (!Array.isArray(runs) || count !== runs.length || count > 100 || signal?.aborted) {
+    return result('BLOCKED', { reason: 'GitHub check-run response is invalid or incomplete' });
+  }
   const findings = [];
+  const checks = [];
+  const missing = [];
   let pending = false;
   for (const name of requiredChecks) {
     const matches = runs.filter((run) => run?.name === name);
-    if (matches.length > 1) return result('BLOCKED');
+    if (matches.length > 1) return result('BLOCKED', { reason: 'required GitHub check name is ambiguous' });
     const [check] = matches;
-    if (check && check.head_sha !== revision) return result('BLOCKED');
-    if (!check || ['queued', 'in_progress', 'pending', 'requested', 'waiting'].includes(check.status)) {
-      pending = true;
+    if (!check) {
+      missing.push(name);
       continue;
     }
-    if (check.status !== 'completed' || !['success', 'failure'].includes(check.conclusion)) return result('BLOCKED');
+    if (check.head_sha !== revision) return result('BLOCKED', { reason: 'GitHub check run is for a different SHA' });
+    if (read && (!Number.isSafeInteger(check.id) || check.id < 1 || check.app?.id !== 15368 ||
+        check.app?.slug !== 'github-actions' || typeof check.url !== 'string' || check.url.toLowerCase() !==
+        `https://api.github.com/repos/${repository}/check-runs/${check.id}`.toLowerCase() ||
+        checks.some(({ id }) => id === check.id))) {
+      return result('BLOCKED', { reason: 'required check run has unverified GitHub Actions provenance' });
+    }
+    if (['queued', 'in_progress', 'pending', 'requested', 'waiting'].includes(check.status)) {
+      pending = true;
+      if (read) checks.push({ id: check.id, name, status: check.status });
+      continue;
+    }
+    if (check.status !== 'completed' || !['success', 'failure'].includes(check.conclusion)) {
+      return result('BLOCKED', { reason: 'required GitHub check has no usable conclusion' });
+    }
+    if (read) {
+      if (!isFreshGitHubTimestamp(check.completed_at, nowMs)) {
+        return result('BLOCKED', { reason: 'required GitHub check has a stale or invalid completion time' });
+      }
+      checks.push({ id: check.id, name, conclusion: check.conclusion, completed_at: check.completed_at });
+    }
     if (check.conclusion === 'failure') findings.push({ id: name, summary: 'Required GitHub check failed' });
   }
-  if (findings.length > 0) return result('FAIL', { findings });
-  return result(pending ? 'PENDING' : 'PASS');
+  const metadata = read ? { checks } : {};
+  if (findings.length > 0) return result('FAIL', { ...metadata, findings });
+  if (missing.length) return result('PENDING', { ...metadata, reason: 'required GitHub check runs are missing' });
+  return result(pending ? 'PENDING' : 'PASS', metadata);
+}
+
+export function isFreshGitHubTimestamp(value, nowMs) {
+  if (typeof value !== 'string' || !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,3})?Z$/.test(value)) return false;
+  const parsed = Date.parse(value);
+  return parsed <= nowMs && nowMs - parsed <= GITHUB_EVIDENCE_MAX_AGE_MS;
 }
 
 /** Collect only read-only GitHub evidence. No successful CI result implies protection. */

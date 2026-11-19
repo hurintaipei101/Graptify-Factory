@@ -80,17 +80,17 @@ export async function executeIssue({ issue, evidence, codingAgent, testRunner } 
 
 export const MAX_REPAIR_CYCLES = MAX_FAILED_CYCLES;
 
-/** Run one initial attempt and up to three targeted, verified repairs. */
-export async function executeRepairCycles({ performAttempt, beforeAttempt, recordAttempt }) {
-  let findings = [];
-  for (let cycle = 0; cycle <= MAX_REPAIR_CYCLES; cycle += 1) {
-    await beforeAttempt(cycle);
+/** Run the initial attempt or continue from a freshly verified failure. */
+export async function executeRepairCycles({ performAttempt, beforeAttempt, recordAttempt, previousFailure }) {
+  let findings = previousFailure?.findings ?? [];
+  const nextCycle = previousFailure ? previousFailure.cycle + 1 : 0;
+  for (let cycle = nextCycle; cycle <= MAX_REPAIR_CYCLES; cycle += 1) {
+    const stopped = await beforeAttempt(cycle);
+    if (stopped) return stopped;
     const outcome = await performAttempt({ cycle, findings });
     await recordAttempt(cycle, outcome);
     if (outcome.status !== 'FAIL') return outcome;
-    if (cycle === MAX_REPAIR_CYCLES) {
-      return { status: 'GATE_A', reason: 'three repair cycles failed verification' };
-    }
     findings = outcome.findings;
   }
+  return { status: 'GATE_A', reason: 'three repair cycles failed verification' };
 }
