@@ -4,6 +4,7 @@ import { mkdir, open, readFile, rename } from 'node:fs/promises';
 import { isAbsolute, join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { executeRepairCycles, MAX_REPAIR_CYCLES } from './executor.mjs';
+import { createGitHubEvidenceProviders } from './github-evidence.mjs';
 import { prepareOfflineIssue } from './orchestrator.mjs';
 
 const SHA = /^[0-9a-f]{40}$/;
@@ -57,7 +58,9 @@ function approvedProfile(profile, approval) {
     typeof approval.repository === 'string' && REPOSITORY.test(approval.repository) &&
     profile.allowed_environments.includes(approval.environment) &&
     typeof approval.baseline === 'string' && SHA.test(approval.baseline) &&
-    shortList(approval.requiredChecks, 1);
+    shortList(approval.requiredChecks, 1) &&
+    (approval.githubPullRequest === undefined || (Number.isInteger(approval.githubPullRequest) &&
+      approval.githubPullRequest > 0 && approval.githubPullRequest <= 2_147_483_647));
 }
 
 function finish(report, status, nextAction) {
@@ -85,20 +88,24 @@ async function syncDirectory(directory) {
   }
 }
 
-async function replay(directory, fingerprint, report) {
+async function replay(directory, fingerprint, report, recheck) {
+  let stored;
   try {
-    const stored = JSON.parse(await readFile(join(directory, 'state.json'), 'utf8'));
-    if (stored.fingerprint !== fingerprint) return finish(report, 'BLOCKED', 'issue already claimed with different approved inputs');
-    if (stored.report.status !== 'RUNNING') return stored.report;
-    return finish(stored.report, 'BLOCKED', 'run is active or interrupted; reconcile persisted state before taking further action');
+    stored = JSON.parse(await readFile(join(directory, 'state.json'), 'utf8'));
+    if (!stored?.report?.status) throw new Error('Missing stored report');
   } catch {
     return finish(report, 'BLOCKED', 'run is claimed but persisted state is unavailable; reconcile before taking further action');
   }
+  if (stored.fingerprint !== fingerprint) return finish(report, 'BLOCKED', 'issue already claimed with different approved inputs');
+  if (stored.report.status === 'RUNNING') {
+    return finish(stored.report, 'BLOCKED', 'run is active or interrupted; reconcile persisted state before taking further action');
+  }
+  return recheck && stored.report.status === 'READY' ? recheck(stored.report) : stored.report;
 }
 
-function validProviders(providers, profile) {
-  return STAGES.every((stage) => providers[stage]?.mode === 'SIMULATION' &&
-    providers[stage]?.kind === KINDS[stage] && shortText(providers[stage]?.principal) &&
+function validProviders(providers, profile, githubProviders) {
+  return STAGES.every((stage) => providers[stage]?.mode === (githubProviders?.[stage]?.mode ?? 'SIMULATION') &&
+    providers[stage]?.kind === (githubProviders?.[stage]?.kind ?? KINDS[stage]) && shortText(providers[stage]?.principal) &&
     typeof providers[stage]?.run === 'function') &&
     providers.coding.profile === profile.role_profile &&
     providers.coding.principal !== providers.review.principal &&
@@ -129,9 +136,10 @@ async function callProvider(run, input, { signal, expiresAt }) {
   }
 }
 
-async function verifyCandidate({ providers, approval, profile, revision, report, cycle, budget, pollIntervalMs }) {
+async function verifyCandidate({ providers, approval, profile, revision, report, cycle, budget, pollIntervalMs,
+  stages = STAGES.slice(1) }) {
   const input = { issueKey: profile.issue_key, repository: approval.repository, revision };
-  for (const stage of STAGES.slice(1)) {
+  for (const stage of stages) {
     const args = stage === 'tests' ? { ...input, acceptanceTests: profile.acceptance_tests }
       : stage === 'ci' ? { ...input, requiredChecks: approval.requiredChecks }
       : { ...input, baseline: approval.baseline, requirements: profile.requirements, acceptanceTests: profile.acceptance_tests };
@@ -147,23 +155,29 @@ async function verifyCandidate({ providers, approval, profile, revision, report,
     let status = result?.status;
     if (!['PASS', 'FAIL', 'GATE_A'].includes(status) || result.revision !== revision ||
         (status === 'FAIL' && findings.length === 0)) status = 'BLOCKED';
-    report.checks.push({ cycle, revision, stage, status, reads, findings: findings.map(({ id }) => id) });
+    const check = { cycle, revision, stage, status, reads, findings: findings.map(({ id }) => id) };
+    const github = approval.githubPullRequest !== undefined && stage !== 'tests';
+    if (github && result?.evidence) check.evidence = result.evidence;
+    if (github && result?.reason) check.reason = result.reason;
+    report.checks.push(check);
     if (status === 'BLOCKED') {
-      const reason = stage === 'ci' && result?.status === 'PENDING' && result.revision === revision
+      const reason = check.reason ?? (stage === 'ci' && result?.status === 'PENDING' && result.revision === revision
         ? 'required GitHub checks are still pending after three reads'
-        : `${stage} provider did not supply usable verification for the candidate revision`;
+        : `${stage} provider did not supply usable verification for the candidate revision`);
       return { status, reason };
     }
     if (status === 'GATE_A') return { status, reason: `${stage} reported a scope, security or permission boundary` };
     if (status === 'FAIL') return { status, findings };
   }
-  return { status: 'PASS', reason: 'simulated tests, CI and independent review passed on the same revision' };
+  return { status: 'PASS', reason: providers.ci.mode === 'LIVE'
+    ? 'simulated tests and live GitHub CI and Codex review passed on the same revision'
+    : 'simulated tests, CI and independent review passed on the same revision' };
 }
 
 /** Run one approved issue with durable deduplication. Only injected simulations can dispatch. */
 export async function runIssueLoop({
   profile, approval, evidence, providers = {}, stateDirectory, realExecution = false,
-  timeoutMs = 120_000, pollIntervalMs = 1_000,
+  timeoutMs = 120_000, pollIntervalMs = 1_000, githubEvidenceFetch,
 } = {}) {
   const report = {
     schema_version: 'factory.issue_run_report.v1',
@@ -187,10 +201,15 @@ export async function runIssueLoop({
   }
 
   profile = structuredClone(Object.fromEntries(PROFILE_FIELDS.map((key) => [key, profile[key]])));
-  const { profileDigest, repository, environment, baseline, requiredChecks } = approval;
-  approval = { profileDigest, repository, environment, baseline, requiredChecks: [...requiredChecks] };
+  const { profileDigest, repository, environment, baseline, requiredChecks, githubPullRequest } = approval;
+  approval = { profileDigest, repository, environment, baseline, requiredChecks: [...requiredChecks], githubPullRequest };
+  const githubProviders = githubPullRequest === undefined ? null
+    : createGitHubEvidenceProviders({ pullRequest: githubPullRequest, fetchImpl: githubEvidenceFetch });
+  if (githubProviders) providers = { ...providers, ...githubProviders };
   report.run_id = hash([approval.repository.toLowerCase(), report.issue_key, report.mode]);
-  const fingerprint = hash([approval.profileDigest, approval.environment, approval.baseline, approval.requiredChecks]);
+  const inputs = [approval.profileDigest, approval.environment, approval.baseline, approval.requiredChecks];
+  if (githubProviders) inputs.push(githubPullRequest, githubProviders.ci.mode);
+  const fingerprint = hash(inputs);
   const directory = join(stateDirectory, report.run_id);
   const save = (current) => persist(directory, { fingerprint, report: current });
   let timeout;
@@ -199,7 +218,10 @@ export async function runIssueLoop({
     try {
       await mkdir(directory, { mode: 0o700 });
     } catch (error) {
-      if (error.code === 'EEXIST') return replay(directory, fingerprint, report);
+      if (error.code === 'EEXIST') {
+        return replay(directory, fingerprint, report, realExecution === false && githubProviders
+          ? recheckGitHubEvidence : undefined);
+      }
       throw error;
     }
     await syncDirectory(stateDirectory);
@@ -220,7 +242,7 @@ export async function runIssueLoop({
           !profile.dependencies.every((key) => dependencies.some((dependency) => dependency?.key === key))) {
         return finish(report, 'BLOCKED', 'preflight evidence does not match the approved repository, baseline or issue dependencies');
       }
-      if (!providers || !validProviders(providers, profile)) return finish(report, 'BLOCKED', 'required simulation providers or independent reviewer are unavailable');
+      if (!providers || !validProviders(providers, profile, githubProviders)) return finish(report, 'BLOCKED', 'required providers or independent reviewer are unavailable');
       const abort = new AbortController();
       const budget = { signal: abort.signal, expiresAt: performance.now() + timeoutMs };
       timeout = setTimeout(() => abort.abort(), timeoutMs);
@@ -273,5 +295,33 @@ export async function runIssueLoop({
     return finish(report, 'BLOCKED', 'durable state could not be written; reconcile before taking further action');
   } finally {
     clearTimeout(timeout);
+  }
+
+  async function recheckGitHubEvidence(stored) {
+    const cycle = stored.repair_cycles;
+    const current = {
+      ...stored,
+      checks: stored.checks.filter((check) => check.cycle !== cycle || check.stage === 'tests'),
+    };
+    const abort = new AbortController();
+    const deadline = setTimeout(() => abort.abort(), timeoutMs);
+    const budget = { signal: abort.signal, expiresAt: performance.now() + timeoutMs };
+    try {
+      const outcome = await verifyCandidate({
+        providers, approval, profile, revision: current.revision, report: current, cycle, budget, pollIntervalMs,
+        stages: ['ci', 'review'],
+      });
+      current.reviewer = {
+        profile: providers.review.principal,
+        verdict: current.checks.find((check) => check.cycle === cycle && check.stage === 'review')?.status ?? 'UNKNOWN',
+      };
+      return outcome.status === 'PASS' ? finish(current, 'READY', outcome.reason)
+        : finish(current, 'BLOCKED', outcome.reason ?? 'stored candidate no longer passes GitHub verification');
+    } catch {
+      return finish({ ...current, reviewer: { profile: providers.review.principal, verdict: 'UNKNOWN' } },
+        'BLOCKED', 'GitHub evidence could not be revalidated');
+    } finally {
+      clearTimeout(deadline);
+    }
   }
 }

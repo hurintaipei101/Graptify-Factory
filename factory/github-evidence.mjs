@@ -1,0 +1,187 @@
+import { inspectGitHubChecks, isFreshGitHubTimestamp } from './evidence-adapter.mjs';
+
+const API = 'https://api.github.com/';
+const CODEX = 'chatgpt-codex-connector';
+const REVIEW_QUERY = `query CandidateReview($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    nameWithOwner
+    pullRequest(number: $number) {
+      number state headRefOid headRepository { nameWithOwner }
+      reviews(first: 100) {
+        pageInfo { hasNextPage }
+        nodes { id state submittedAt commit { oid } author { login __typename } }
+      }
+      reviewThreads(first: 100) {
+        pageInfo { hasNextPage }
+        nodes {
+          id isResolved
+          comments(first: 1) {
+            nodes {
+              id body createdAt updatedAt author { login __typename }
+              originalCommit { oid } pullRequestReview { id }
+            }
+          }
+        }
+      }
+    }
+  }
+}`;
+
+const sha = (value) => typeof value === 'string' && /^[0-9a-f]{40}$/.test(value);
+const id = (value) => typeof value === 'string' && /^[\w=+/\-]{1,128}$/.test(value);
+const sameRepo = (actual, expected) => typeof actual === 'string' && actual.toLowerCase() === expected.toLowerCase();
+const isCodex = (author) => author?.login === CODEX && author.__typename === 'Bot';
+const fullConnection = (value) => value?.pageInfo?.hasNextPage === false && Array.isArray(value.nodes) && value.nodes.length <= 100;
+const states = new Set(['APPROVED', 'CHANGES_REQUESTED', 'COMMENTED', 'DISMISSED', 'PENDING']);
+
+function verifyReview(pr, revision, nowMs) {
+  const blocked = (reason, details) => ({ status: 'BLOCKED', reason, details });
+  if (!fullConnection(pr.reviews) || !fullConnection(pr.reviewThreads)) {
+    return blocked('GitHub review or thread response is invalid or incomplete');
+  }
+  const byId = new Map();
+  for (const review of pr.reviews.nodes) {
+    if (!id(review?.id) || byId.has(review.id) || !states.has(review.state) ||
+        (!sha(review.commit?.oid) && (review.state !== 'PENDING' || review.commit != null))) {
+      return blocked('GitHub review response has invalid or duplicate entries');
+    }
+    byId.set(review.id, review);
+  }
+  const codexReviews = [...byId.values()].filter(({ author }) => isCodex(author));
+  const current = codexReviews.filter(({ commit }) => commit?.oid === revision);
+  if (codexReviews.some(({ state, commit }) => state === 'PENDING' && (!commit || commit.oid === revision))) {
+    return blocked('Codex review is pending');
+  }
+  if (current.length === 0) return blocked('no trusted Codex review is bound to the candidate SHA');
+  if (current.length !== 1) return blocked('multiple trusted Codex reviews are bound to the candidate SHA');
+  const [review] = current;
+  if (!isFreshGitHubTimestamp(review.submittedAt, nowMs)) return blocked('Codex review completion is stale or invalid');
+  const details = {
+    author: CODEX, review_id: review.id, state: review.state, submitted_at: review.submittedAt, findings: [],
+  };
+  if (review.state === 'DISMISSED') return blocked('Codex review was dismissed', details);
+  const threadIds = new Set();
+  const commentIds = new Set();
+  const findings = [];
+  for (const thread of pr.reviewThreads.nodes) {
+    const roots = thread?.comments?.nodes;
+    const comment = Array.isArray(roots) && roots.length === 1 ? roots[0] : null;
+    if (!id(thread?.id) || threadIds.has(thread.id) || typeof thread.isResolved !== 'boolean' ||
+        !id(comment?.id) || commentIds.has(comment.id)) {
+      return blocked('GitHub review thread lacks a unique root comment or resolution state', details);
+    }
+    threadIds.add(thread.id);
+    commentIds.add(comment.id);
+    const fromReview = comment.pullRequestReview?.id === review.id;
+    const fromCandidate = isCodex(comment.author) && comment.originalCommit?.oid === revision;
+    if (!fromReview && !fromCandidate) continue;
+    if (!fromReview || !fromCandidate || typeof comment.body !== 'string' ||
+        !isFreshGitHubTimestamp(comment.createdAt, nowMs) || comment.updatedAt !== comment.createdAt) {
+      return blocked('Codex review comment has mismatched or unverifiable provenance', details);
+    }
+    const severity = /^\*\*<sub><sub>!\[(P[0-3]) Badge\]\(https:\/\/img\.shields\.io\/badge\/\1-[a-z]+\?style=flat\)<\/sub><\/sub>/.exec(comment.body)?.[1];
+    if (!severity || !comment.body.trimEnd().endsWith('<!-- codex-code-review-finding:v1 -->')) {
+      return blocked('Codex finding format is unrecognized', details);
+    }
+    if (thread.isResolved || !['P0', 'P1'].includes(severity)) continue;
+    if (findings.length === 8) return blocked('Codex findings exceed the repair evidence limit', details);
+    details.findings.push({ thread_id: thread.id, comment_id: comment.id, severity });
+    findings.push({ id: comment.id, summary: `Resolve the open Codex ${severity} finding in GitHub` });
+  }
+  if (findings.length) return { status: 'FAIL', findings, details };
+  if (review.state !== 'APPROVED') return blocked('Codex review has no verifiable approval for the candidate SHA', details);
+  return { status: 'PASS', details };
+}
+
+/** Use the Actions job token on GitHub.com. An injected API transport is always simulated. */
+export function createGitHubEvidenceProviders({ pullRequest, fetchImpl } = {}) {
+  const mode = fetchImpl === undefined ? 'LIVE' : 'SIMULATION';
+  const request = mode === 'LIVE' ? globalThis.fetch : fetchImpl;
+  const source = mode === 'LIVE' ? 'github.com:read-only' : 'fixture:github-api';
+
+  async function read(endpoint, { repository, signal, query, variables }) {
+    const { GITHUB_ACTIONS, GITHUB_REPOSITORY, GITHUB_TOKEN, GH_TOKEN } = process.env;
+    const token = GITHUB_TOKEN || GH_TOKEN;
+    if (mode === 'LIVE' && (GITHUB_ACTIONS !== 'true' || !sameRepo(GITHUB_REPOSITORY, repository) || !token)) {
+      return { ok: false, reason: 'missing GitHub Actions job token for the approved repository' };
+    }
+    const headers = { accept: 'application/vnd.github+json', 'x-github-api-version': '2022-11-28' };
+    if (mode === 'LIVE') headers.authorization = `Bearer ${token}`;
+    if (query) headers['content-type'] = 'application/json';
+    try {
+      const response = await request(API + endpoint, {
+        headers, redirect: 'error', cache: 'no-store',
+        signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(10_000)]) : AbortSignal.timeout(10_000),
+        method: query ? 'POST' : 'GET',
+        body: query ? JSON.stringify({ query, variables }) : undefined,
+      });
+      if (!response.ok) {
+        const permission = endpoint.includes('/check-runs?') ? 'checks: read' : 'pull-requests: read';
+        const reason = [401, 403, 404].includes(response.status)
+          ? `GitHub API HTTP ${response.status}; verify job token access (${permission})`
+          : `GitHub API request failed (HTTP ${Number.isInteger(response.status) ? response.status : 'unknown'})`;
+        return { ok: false, reason };
+      }
+      const value = await response.json();
+      if (query && value?.errors !== undefined) {
+        const denied = Array.isArray(value.errors) && value.errors.some((error) =>
+          ['FORBIDDEN', 'UNAUTHORIZED', 'INSUFFICIENT_SCOPES'].includes(error?.type));
+        return { ok: false, reason: denied ? 'GitHub GraphQL denied pull-request read access' : 'GitHub GraphQL returned errors' };
+      }
+      return { ok: true, value };
+    } catch {
+      return { ok: false, reason: 'GitHub API response was unavailable or invalid' };
+    }
+  }
+
+  function provider(kind, principal, inspect) {
+    return {
+      mode, kind, principal,
+      async run(input, { signal } = {}) {
+        const { repository, revision } = input;
+        const options = { repository, signal };
+        if (typeof repository !== 'string' || !/^[\w.-]{1,100}\/[\w.-]{1,100}$/.test(repository) ||
+            repository.split('/').some((part) => part === '.' || part === '..') || !sha(revision) ||
+            !Number.isInteger(pullRequest) || pullRequest < 1 || pullRequest > 2_147_483_647) {
+          return { revision, status: 'BLOCKED', reason: 'invalid approved repository, PR number or candidate SHA' };
+        }
+        const { details, ...result } = await inspect(input, options);
+        return {
+          ...result, revision,
+          evidence: { mode, source, repository, pull_request: pullRequest, observed_at: new Date().toISOString(), ...details },
+        };
+      },
+    };
+  }
+
+  const ci = provider('read-only', 'github-actions', async (input, options) => {
+    const { repository, revision } = input;
+    const response = await read(`repos/${repository}/pulls/${pullRequest}`, options);
+    if (!response.ok) return { status: 'BLOCKED', reason: response.reason };
+    const pr = response.value;
+    if (!sameRepo(pr?.base?.repo?.full_name, repository) || !sameRepo(pr?.head?.repo?.full_name, repository) ||
+        pr.number !== pullRequest || pr.state !== 'open' || pr.head.sha !== revision) {
+      return { status: 'BLOCKED', reason: 'GitHub pull request does not match the repository and candidate head' };
+    }
+    const { checks, ...result } = await inspectGitHubChecks({
+      ...input, ...options, read: (endpoint) => read(endpoint, options),
+    });
+    return { ...result, details: checks ? { app: 'github-actions', app_id: 15368, checks } : undefined };
+  });
+
+  const review = provider('read-only', CODEX, async ({ repository, revision }, options) => {
+    const [owner, name] = repository.split('/');
+    const response = await read('graphql', {
+      ...options, query: REVIEW_QUERY, variables: { owner, name, number: pullRequest },
+    });
+    if (!response.ok) return { status: 'BLOCKED', reason: response.reason };
+    const repo = response.value?.data?.repository;
+    const pr = repo?.pullRequest;
+    if (!sameRepo(repo?.nameWithOwner, repository) || !sameRepo(pr?.headRepository?.nameWithOwner, repository) ||
+        pr.number !== pullRequest || pr.state !== 'OPEN' || pr.headRefOid !== revision) {
+      return { status: 'BLOCKED', reason: 'GitHub review is for a different repository, PR or candidate head' };
+    }
+    return verifyReview(pr, revision, Date.now());
+  });
+  return { ci, review };
+}
