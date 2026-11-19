@@ -1,8 +1,12 @@
+import { addAbortListener } from 'node:events';
 import { realpath, stat } from 'node:fs/promises';
 import path from 'node:path';
+import { TextDecoder } from 'node:util';
 
 const DEFAULT_LIMITS = Object.freeze({ timeoutMs: 120_000, maxEvents: 256, maxEventBytes: 16_384, maxOutputBytes: 32_768 });
 const FORBIDDEN_CAPABILITIES = new Set(['merge', 'deploy', 'production']);
+const TERMINATION_GRACE_MS = 100;
+const CLOSE_CONFIRMATION_MS = 250;
 
 function fail(reason, evidence = {}) { return { status: 'FAIL', passed: false, reason, evidence: compactEvidence(evidence) }; }
 function compactEvidence(evidence) {
@@ -19,24 +23,28 @@ async function verifiedWorkspace(workspace, allowedWorkspaces) {
   return resolved;
 }
 function parseJsonl(text, limits) {
-  let bytes = 0; const events = []; let lastEventType = null;
-  for (const line of text.split(/\r?\n/)) {
-    if (!line.trim()) continue;
-    bytes += Buffer.byteLength(line);
-    if (bytes > limits.maxOutputBytes) throw new Error('JSONL output exceeds bounded memory limit');
+  let eventCount = 0;
+  let lastEventType = null;
+  let turnCompleted = false;
+  let turnFailed = false;
+  const lines = text.split(/\r?\n/);
+  if (lines.at(-1) === '') lines.pop();
+  for (const line of lines) {
     if (Buffer.byteLength(line) > limits.maxEventBytes) throw new Error('JSONL event exceeds bounded memory limit');
     let event; try { event = JSON.parse(line); } catch { throw new Error('malformed JSONL event'); }
     if (!event || typeof event !== 'object' || Array.isArray(event)) throw new Error('JSONL event must be an object');
-    if (events.length < limits.maxEvents) events.push(event);
+    if (eventCount < limits.maxEvents) eventCount += 1;
     lastEventType = typeof event.type === 'string' ? event.type : null;
+    if (lastEventType === 'turn.completed') turnCompleted = true;
+    if (lastEventType === 'turn.failed') turnFailed = true;
   }
-  return { eventCount: events.length, lastEventType, events };
+  return { eventCount, lastEventType, turnCompleted, turnFailed };
 }
 
 /** Create a bounded, injectable adapter. Real execution is opt-in and isolation is fail-closed. */
 export function createCodexCliAdapter(options = {}) {
   const { spawn = null, allowedWorkspaces = [], realExecution = false, runtimeIsolation = {}, mcpAccess = {}, timeoutMs = DEFAULT_LIMITS.timeoutMs, maxEvents = DEFAULT_LIMITS.maxEvents, maxEventBytes = DEFAULT_LIMITS.maxEventBytes, maxOutputBytes = DEFAULT_LIMITS.maxOutputBytes } = options;
-  const limits = { timeoutMs, maxEvents, maxEventBytes, maxOutputBytes };
+  const limits = { maxEvents, maxEventBytes };
   return async function runCodex(issue = {}, context = {}) {
     if (issue?.status === 'BLOCKED' || issue?.status === 'STOP' || context?.status === 'BLOCKED' || context?.status === 'STOP') return fail('execution status does not permit subprocess');
     if (!realExecution) return fail('real Codex execution is disabled by default');
@@ -48,25 +56,120 @@ export function createCodexCliAdapter(options = {}) {
     let workspace;
     try { workspace = await verifiedWorkspace(context.workspace ?? issue.workspace, allowedWorkspaces); } catch (error) { return fail(error.message); }
     if (typeof spawn !== 'function') return fail('injectable process factory is required');
+    const abortSignal = context.signal;
+    if (abortSignal?.aborted) return fail('execution cancelled', { cancelled: true });
     const args = ['exec', '--json', '--sandbox', 'read-only', '--skip-git-repo-check', String(context.prompt ?? issue.prompt ?? '')];
     const env = { PATH: process.env.PATH ?? '', CODEX_HOME: context.codexHome ?? path.join(workspace, '.codex-isolated') };
+    // Match Node's setTimeout delay normalization for the execution budget.
+    const requestedDelay = Number(timeoutMs);
+    const executionDelay = requestedDelay >= 1 && requestedDelay <= 2_147_483_647 ? Math.trunc(requestedDelay) : 1;
     return new Promise((resolve) => {
-      let settled = false; let stdout = ''; let stderr = ''; let timer;
-      const finish = (result) => { if (settled) return; settled = true; clearTimeout(timer); resolve(result); };
+      let settled = false;
+      let exited = false;
+      let termination;
+      let executionTimer;
+      let escalationTimer;
+      let confirmationTimer;
+      let abortSubscription;
+      let stdout = '';
+      let stdoutBytes = 0;
+      const stdoutDecoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
       let child;
+      const finish = (result) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(executionTimer);
+        clearTimeout(escalationTimer);
+        clearTimeout(confirmationTimer);
+        abortSubscription?.[Symbol.dispose]();
+        resolve(result);
+      };
+      const sendSignal = (signal) => {
+        try { child.kill?.(signal); } catch {
+          // Signal delivery can fail. The close event or confirmation deadline determines the result.
+        }
+      };
+      const waitForClose = () => {
+        if (confirmationTimer) return;
+        const { reason, evidence } = termination;
+        confirmationTimer = setTimeout(() => {
+          finish(fail(`${reason}; termination failed: child close was not confirmed`, evidence));
+          child.stdin?.destroy?.();
+          child.stdout?.destroy?.();
+          child.stderr?.destroy?.();
+          child.unref?.();
+        }, CLOSE_CONFIRMATION_MS);
+      };
+      const terminate = (reason, evidence = {}) => {
+        if (settled || termination) return;
+        termination = { reason, evidence };
+        stdout = '';
+        clearTimeout(executionTimer);
+        if (exited) return waitForClose();
+        escalationTimer = setTimeout(() => {
+          waitForClose();
+          sendSignal('SIGKILL');
+        }, TERMINATION_GRACE_MS);
+        sendSignal('SIGTERM');
+      };
+      const cancel = () => {
+        if (child) terminate('execution cancelled', { cancelled: true });
+      };
+      const checkDeadline = () => {
+        if (settled || termination) return;
+        const remainingMs = Number(deadline - process.hrtime.bigint()) / 1_000_000;
+        if (remainingMs <= 0) return terminate('execution timed out', { timedOut: true });
+        executionTimer = setTimeout(checkDeadline, Math.ceil(remainingMs));
+      };
+      const closeFailure = (evidence) => {
+        if (abortSignal?.aborted) return fail('execution cancelled', { ...evidence, cancelled: true });
+        if (process.hrtime.bigint() >= deadline) return fail('execution timed out', { ...evidence, timedOut: true });
+        return null;
+      };
+      if (abortSignal) abortSubscription = addAbortListener(abortSignal, cancel);
+      const deadline = process.hrtime.bigint() + BigInt(executionDelay) * 1_000_000n;
+      if (abortSignal?.aborted) return finish(fail('execution cancelled', { cancelled: true }));
       try { child = spawn('codex', args, { cwd: workspace, env, windowsHide: true }); } catch (error) { finish(fail(`spawn failed: ${error.message}`)); return; }
-      const cancel = () => { if (!settled) { child.kill?.('SIGTERM'); finish(fail('execution cancelled', { cancelled: true })); } };
-      if (context.signal) { if (context.signal.aborted) return cancel(); context.signal.addEventListener('abort', cancel, { once: true }); }
-      child.stdout?.on('data', (chunk) => { stdout += String(chunk); if (Buffer.byteLength(stdout) > maxOutputBytes) child.kill?.('SIGTERM'); });
-      child.stderr?.on('data', (chunk) => { stderr += String(chunk).slice(0, maxOutputBytes); });
-      timer = setTimeout(() => { child.kill?.('SIGTERM'); finish(fail('execution timed out', { timedOut: true })); }, timeoutMs);
-      child.on('error', (error) => finish(fail(`process error: ${error.message}`)));
+      child.on('error', (error) => terminate(`process error: ${error.message}`));
+      child.on('exit', () => {
+        if (settled) return;
+        exited = true;
+        clearTimeout(escalationTimer);
+        if (termination) waitForClose();
+      });
       child.on('close', (exitCode, signal) => {
         if (settled) return;
+        exited = true;
+        if (termination) return finish(fail(termination.reason, { ...termination.evidence, exitCode, signal }));
+        const failure = closeFailure({ exitCode, signal });
+        if (failure) return finish(failure);
+        try {
+          stdout += stdoutDecoder.decode();
+        } catch {
+          return finish(fail('invalid UTF-8 in Codex CLI stdout', { exitCode, signal }));
+        }
         let parsed; try { parsed = parseJsonl(stdout, limits); } catch (error) { finish(fail(error.message, { exitCode, signal })); return; }
-        const evidence = { ...parsed, exitCode, signal, stderr: stderr.slice(0, 512) };
-        finish(exitCode === 0 ? { status: 'PASS', passed: true, evidence: compactEvidence(evidence) } : fail(`Codex CLI exited with code ${exitCode}`, evidence));
+        const evidence = { ...parsed, exitCode, signal };
+        if (exitCode !== 0) return finish(fail(`Codex CLI exited with code ${exitCode}`, evidence));
+        if (parsed.turnFailed) return finish(fail('Codex CLI reported turn.failed', evidence));
+        if (!parsed.turnCompleted) return finish(fail('Codex CLI did not report turn.completed', evidence));
+        finish(closeFailure(evidence) ?? { status: 'PASS', passed: true, evidence: compactEvidence(evidence) });
       });
+      child.stdout?.on('data', (chunk) => {
+        if (settled || termination) return;
+        if (!(chunk instanceof Uint8Array)) return terminate('Codex CLI stdout must supply raw bytes');
+        stdoutBytes += chunk.byteLength;
+        if (stdoutBytes > maxOutputBytes) return terminate('JSONL output exceeds bounded memory limit');
+        try {
+          stdout += stdoutDecoder.decode(chunk, { stream: true });
+        } catch {
+          terminate('invalid UTF-8 in Codex CLI stdout');
+        }
+      });
+      // Drain stderr without retaining it because compact evidence excludes it.
+      child.stderr?.on('data', () => {});
+      if (abortSignal?.aborted) cancel();
+      checkDeadline();
     });
   };
 }
