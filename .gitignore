@@ -1,0 +1,22 @@
+﻿# Local execution and audit data
+/results/
+/tools/
+/f2/
+/farm/
+/factory/CURRENT_TASK.txt
+
+# Local runtime and credentials
+**/node_modules/
+**/.env
+**/.env.*
+**/.codex/
+**/.codex-isolated/
+**/credentials.json
+**/auth.json
+
+# Generated files
+*.log
+*.zip
+__pycache__/
+
+**/.serena/

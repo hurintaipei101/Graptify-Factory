@@ -1,0 +1,18 @@
+{
+  "schema_version": "factory.issue_run_report.v1",
+  "run_id": "sample-placeholder",
+  "issue_key": "F2-09",
+  "status": "NOT_RUN",
+  "revision": null,
+  "attempts": [],
+  "checks": [],
+  "reviewer": {"profile": null, "verdict": "UNKNOWN"},
+  "usage": {"model": null, "reported_input_tokens": null, "reported_output_tokens": null, "account_rate_limit": null, "estimated_cost": null},
+  "tools": [],
+  "context_sources": [],
+  "repeated_or_unnecessary_reads": [],
+  "memory_entries": [],
+  "security_incidents": [],
+  "owner_gate": null,
+  "next_action": "Await execution evidence"
+}

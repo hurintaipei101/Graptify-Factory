@@ -1,0 +1,19 @@
+{
+  "schema_version": "factory.issue_execution.v1",
+  "issue_key": "F2-09",
+  "linear_issue_id": null,
+  "project": "factory-mini-task-board",
+  "module": "task-create-edit",
+  "architecture_revision": "pending-approval",
+  "dependencies": ["F2-03", "F2-04"],
+  "role_profile": "coding-agent",
+  "model": "codex-available-approved-model",
+  "allowed_environments": ["isolated-worker", "test", "staging"],
+  "forbidden_operations": ["production-deploy", "change-production-data", "read-unapproved-secrets", "relax-protected-tests"],
+  "max_repair_cycles": 3,
+  "requirements": ["Create and edit small demo tasks", "Persist with TEST data only"],
+  "acceptance_tests": ["T01", "T02", "T03", "T09"],
+  "memory_scope": {"short_term": "issue", "long_term": "project/module", "allow_customer_data": false},
+  "merge_policy": "auto-only-with-enforced-required-checks",
+  "release_policy": "staging-only-until-owner-final-acceptance"
+}
