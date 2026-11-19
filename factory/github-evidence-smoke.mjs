@@ -2,6 +2,11 @@ import { appendFileSync } from 'node:fs';
 import { observeMergedGitHubEvidence } from './github-evidence.mjs';
 
 const repository = 'hurintaipei101/Graptify-Factory';
+export const mergedEvidenceTarget = Object.freeze({
+  repository, pullRequest: 4, requiredCheck: 'Node 22 Tests',
+  revision: '905907b9bf228b2304784c87a095572fa7fb994e',
+  mergeCommit: '36b717c786bc03e55007a978442b527871f67345',
+});
 const { GITHUB_ACTIONS, GITHUB_EVENT_NAME, GITHUB_REF, GITHUB_REPOSITORY, GITHUB_TOKEN, GITHUB_STEP_SUMMARY } = process.env;
 
 async function run() {
@@ -12,14 +17,10 @@ async function run() {
       reason: 'A manual dispatch from trusted main with its Actions job token is required',
     };
   }
-  return observeMergedGitHubEvidence({
-    repository, pullRequest: 4, requiredCheck: 'Node 22 Tests',
-    revision: '905907b9bf228b2304784c87a095572fa7fb994e',
-    mergeCommit: '36b717c786bc03e55007a978442b527871f67345',
-  });
+  return observeMergedGitHubEvidence(mergedEvidenceTarget);
 }
 
-try {
+if (import.meta.main) try {
   const report = await run();
   const json = JSON.stringify(report);
   console.log(json);

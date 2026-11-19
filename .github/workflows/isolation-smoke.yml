@@ -1,0 +1,92 @@
+name: Safe Coding Dispatch Isolation Smoke
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  worker:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.repository == 'hurintaipei101/Graptify-Factory'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      controls: ${{ steps.probes.outputs.controls }}
+      candidate_sha: ${{ steps.probes.outputs.candidate_sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - name: Preload pinned probe image
+        continue-on-error: true
+        run: docker pull --platform linux/amd64 docker.io/library/node@sha256:47725aca53d3295ec2d3be8f62726599b3033cc262edc2c7e429909b3ac599fc
+      - name: Run fixed worker probes
+        id: probes
+        run: node factory/isolation-smoke.mjs worker
+
+  denied-evidence:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.repository == 'hurintaipei101/Graptify-Factory'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      permission_negative: ${{ steps.denied.outputs.permission_negative }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - name: Probe GitHub evidence with restricted permissions
+        id: denied
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node factory/isolation-smoke.mjs denied
+
+  report:
+    if: '!cancelled() && github.event_name == ''workflow_dispatch'' && github.ref == ''refs/heads/main'' && github.repository == ''hurintaipei101/Graptify-Factory'''
+    needs: [worker, denied-evidence]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      checks: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - name: Verify candidate handoff and summarize evidence
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          WORKER_CANDIDATE_SHA: ${{ needs.worker.outputs.candidate_sha }}
+          WORKER_CONTROLS: ${{ needs.worker.outputs.controls }}
+          PERMISSION_NEGATIVE: ${{ needs.denied-evidence.outputs.permission_negative }}
+        run: node factory/isolation-smoke.mjs report
+      - name: Upload sanitized evidence
+        if: '!cancelled()'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: isolation-evidence
+          path: isolation-evidence.json
+          if-no-files-found: error
+          retention-days: 14
