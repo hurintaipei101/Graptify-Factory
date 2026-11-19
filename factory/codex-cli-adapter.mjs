@@ -10,7 +10,7 @@ const CLOSE_CONFIRMATION_MS = 250;
 
 function fail(reason, evidence = {}) { return { status: 'FAIL', passed: false, reason, evidence: compactEvidence(evidence) }; }
 function compactEvidence(evidence) {
-  return { eventCount: evidence.eventCount ?? 0, lastEventType: evidence.lastEventType ?? null, exitCode: evidence.exitCode ?? null, signal: evidence.signal ?? null, timedOut: evidence.timedOut === true, cancelled: evidence.cancelled === true };
+  return { eventCount: evidence.eventCount ?? 0, lastEventType: evidence.lastEventType ?? null, exitCode: evidence.exitCode ?? null, signal: evidence.signal ?? null, timedOut: evidence.timedOut === true, cancelled: evidence.cancelled === true, closeConfirmed: evidence.closeConfirmed === true };
 }
 function isInside(child, root) { return child === root || child.startsWith(`${root}${path.sep}`); }
 async function verifiedWorkspace(workspace, allowedWorkspaces) {
@@ -34,20 +34,21 @@ function parseJsonl(text, limits) {
     let event; try { event = JSON.parse(line); } catch { throw new Error('malformed JSONL event'); }
     if (!event || typeof event !== 'object' || Array.isArray(event)) throw new Error('JSONL event must be an object');
     if (eventCount < limits.maxEvents) eventCount += 1;
-    lastEventType = typeof event.type === 'string' ? event.type : null;
+    lastEventType = typeof event.type === 'string' && event.type.length <= 64 ? event.type : null;
     if (lastEventType === 'turn.completed') turnCompleted = true;
     if (lastEventType === 'turn.failed') turnFailed = true;
   }
   return { eventCount, lastEventType, turnCompleted, turnFailed };
 }
 
-/** Create a bounded, injectable adapter. Real execution is opt-in and isolation is fail-closed. */
+/** Exercise the CLI protocol with an injected test transport. Live isolation is unavailable. */
 export function createCodexCliAdapter(options = {}) {
-  const { spawn = null, allowedWorkspaces = [], realExecution = false, runtimeIsolation = {}, mcpAccess = {}, timeoutMs = DEFAULT_LIMITS.timeoutMs, maxEvents = DEFAULT_LIMITS.maxEvents, maxEventBytes = DEFAULT_LIMITS.maxEventBytes, maxOutputBytes = DEFAULT_LIMITS.maxOutputBytes } = options;
+  const { spawnFixture = null, allowedWorkspaces = [], realExecution = false, simulation = false, runtimeIsolation = {}, mcpAccess = {}, timeoutMs = DEFAULT_LIMITS.timeoutMs, maxEvents = DEFAULT_LIMITS.maxEvents, maxEventBytes = DEFAULT_LIMITS.maxEventBytes, maxOutputBytes = DEFAULT_LIMITS.maxOutputBytes } = options;
   const limits = { maxEvents, maxEventBytes };
   return async function runCodex(issue = {}, context = {}) {
     if (issue?.status === 'BLOCKED' || issue?.status === 'STOP' || context?.status === 'BLOCKED' || context?.status === 'STOP') return fail('execution status does not permit subprocess');
-    if (!realExecution) return fail('real Codex execution is disabled by default');
+    if (realExecution !== false) return { ...fail('live Codex process isolation is not verified'), status: 'BLOCKED' };
+    if (simulation !== true) return fail('real Codex execution is disabled by default');
     if (runtimeIsolation?.verified !== true) return fail('runtime isolation is not verified');
     if (mcpAccess?.verified !== true || mcpAccess?.allowed !== true) return fail('configured MCP access is not verified');
     if (issue?.environment === 'production' || issue?.production === true) return fail('production path is forbidden');
@@ -55,11 +56,11 @@ export function createCodexCliAdapter(options = {}) {
     if (!Array.isArray(capabilities) || capabilities.some((value) => FORBIDDEN_CAPABILITIES.has(String(value).toLowerCase()))) return fail('merge/deploy/production capability is forbidden');
     let workspace;
     try { workspace = await verifiedWorkspace(context.workspace ?? issue.workspace, allowedWorkspaces); } catch (error) { return fail(error.message); }
-    if (typeof spawn !== 'function') return fail('injectable process factory is required');
+    if (typeof spawnFixture !== 'function') return fail('a simulated process fixture is required');
     const abortSignal = context.signal;
     if (abortSignal?.aborted) return fail('execution cancelled', { cancelled: true });
     const args = ['exec', '--json', '--sandbox', 'read-only', '--skip-git-repo-check', String(context.prompt ?? issue.prompt ?? '')];
-    const env = { PATH: process.env.PATH ?? '', CODEX_HOME: context.codexHome ?? path.join(workspace, '.codex-isolated') };
+    const env = { PATH: '', HOME: path.join(workspace, '.codex-isolated'), CODEX_HOME: path.join(workspace, '.codex-isolated') };
     // Match Node's setTimeout delay normalization for the execution budget.
     const requestedDelay = Number(timeoutMs);
     const executionDelay = requestedDelay >= 1 && requestedDelay <= 2_147_483_647 ? Math.trunc(requestedDelay) : 1;
@@ -72,7 +73,7 @@ export function createCodexCliAdapter(options = {}) {
       let confirmationTimer;
       let abortSubscription;
       let stdout = '';
-      let stdoutBytes = 0;
+      let outputBytes = 0;
       const stdoutDecoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
       let child;
       const finish = (result) => {
@@ -129,8 +130,15 @@ export function createCodexCliAdapter(options = {}) {
       if (abortSignal) abortSubscription = addAbortListener(abortSignal, cancel);
       const deadline = process.hrtime.bigint() + BigInt(executionDelay) * 1_000_000n;
       if (abortSignal?.aborted) return finish(fail('execution cancelled', { cancelled: true }));
-      try { child = spawn('codex', args, { cwd: workspace, env, windowsHide: true }); } catch (error) { finish(fail(`spawn failed: ${error.message}`)); return; }
-      child.on('error', (error) => terminate(`process error: ${error.message}`));
+      try {
+        child = spawnFixture({
+          command: 'codex', args, options: { cwd: workspace, env, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true },
+        });
+      } catch {
+        finish(fail('Codex CLI spawn failed'));
+        return;
+      }
+      child.on('error', () => terminate('Codex CLI process error'));
       child.on('exit', () => {
         if (settled) return;
         exited = true;
@@ -140,16 +148,17 @@ export function createCodexCliAdapter(options = {}) {
       child.on('close', (exitCode, signal) => {
         if (settled) return;
         exited = true;
-        if (termination) return finish(fail(termination.reason, { ...termination.evidence, exitCode, signal }));
-        const failure = closeFailure({ exitCode, signal });
+        const closed = { exitCode, signal, closeConfirmed: true };
+        if (termination) return finish(fail(termination.reason, { ...termination.evidence, ...closed }));
+        const failure = closeFailure(closed);
         if (failure) return finish(failure);
         try {
           stdout += stdoutDecoder.decode();
         } catch {
-          return finish(fail('invalid UTF-8 in Codex CLI stdout', { exitCode, signal }));
+          return finish(fail('invalid UTF-8 in Codex CLI stdout', closed));
         }
-        let parsed; try { parsed = parseJsonl(stdout, limits); } catch (error) { finish(fail(error.message, { exitCode, signal })); return; }
-        const evidence = { ...parsed, exitCode, signal };
+        let parsed; try { parsed = parseJsonl(stdout, limits); } catch (error) { finish(fail(error.message, closed)); return; }
+        const evidence = { ...parsed, ...closed };
         if (exitCode !== 0) return finish(fail(`Codex CLI exited with code ${exitCode}`, evidence));
         if (parsed.turnFailed) return finish(fail('Codex CLI reported turn.failed', evidence));
         if (!parsed.turnCompleted) return finish(fail('Codex CLI did not report turn.completed', evidence));
@@ -158,16 +167,20 @@ export function createCodexCliAdapter(options = {}) {
       child.stdout?.on('data', (chunk) => {
         if (settled || termination) return;
         if (!(chunk instanceof Uint8Array)) return terminate('Codex CLI stdout must supply raw bytes');
-        stdoutBytes += chunk.byteLength;
-        if (stdoutBytes > maxOutputBytes) return terminate('JSONL output exceeds bounded memory limit');
+        outputBytes += chunk.byteLength;
+        if (outputBytes > maxOutputBytes) return terminate('CLI output exceeds bounded memory limit');
         try {
           stdout += stdoutDecoder.decode(chunk, { stream: true });
         } catch {
           terminate('invalid UTF-8 in Codex CLI stdout');
         }
       });
-      // Drain stderr without retaining it because compact evidence excludes it.
-      child.stderr?.on('data', () => {});
+      child.stderr?.on('data', (chunk) => {
+        if (settled || termination) return;
+        if (!(chunk instanceof Uint8Array)) return terminate('Codex CLI stderr must supply raw bytes');
+        outputBytes += chunk.byteLength;
+        if (outputBytes > maxOutputBytes) terminate('CLI output exceeds bounded memory limit');
+      });
       if (abortSignal?.aborted) cancel();
       checkDeadline();
     });

@@ -3,8 +3,9 @@ import { addAbortListener } from 'node:events';
 import { mkdir, open, readFile, rename, rmdir } from 'node:fs/promises';
 import { isAbsolute, join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
+import { createCodexCliAdapter } from './codex-cli-adapter.mjs';
 import { executeRepairCycles, MAX_REPAIR_CYCLES } from './executor.mjs';
-import { createGitHubEvidenceProviders } from './github-evidence.mjs';
+import { createGitHubEvidenceProviders, hasGitHubEvidenceCredential } from './github-evidence.mjs';
 import { prepareOfflineIssue } from './orchestrator.mjs';
 
 const SHA = /^[0-9a-f]{40}$/;
@@ -67,10 +68,10 @@ function approvedProfile(profile, approval) {
     shortList(profile.allowed_environments, 1) && profile.allowed_environments.every((name) => ENVIRONMENTS.has(name)) &&
     shortList(profile.forbidden_operations) && shortList(profile.requirements, 1, 512) &&
     shortList(profile.acceptance_tests, 1) && profile.max_repair_cycles === MAX_REPAIR_CYCLES &&
-    validMemoryScope(profile.memory_scope) &&
     shortText(profile.merge_policy) && shortText(profile.release_policy) &&
     approval?.approved === true && approval.profileDigest === issueProfileDigest(profile) &&
     typeof approval.repository === 'string' && REPOSITORY.test(approval.repository) &&
+    approval.repository.split('/').every((part) => part !== '.' && part !== '..') &&
     profile.allowed_environments.includes(approval.environment) &&
     typeof approval.baseline === 'string' && SHA.test(approval.baseline) &&
     shortList(approval.requiredChecks, 1) &&
@@ -165,7 +166,12 @@ async function replay(directory, fingerprint, report, recheck) {
       stored.report = current;
       await persist(directory, stored);
     };
-    await save(await recheck(stored.report, save));
+    const refreshed = await recheck(stored.report, save);
+    if (refreshed === null) {
+      // Retain the prior verification and the refresh cooldown for the next replay.
+      return finish(stored.report, 'BLOCKED', 'execution cancelled during GitHub evidence refresh');
+    }
+    await save(refreshed);
     return stored.report;
   } finally {
     await rmdir(lock);
@@ -189,6 +195,14 @@ function compactFindings(findings, stage, allowedChecks) {
 }
 
 class ProviderDeadline extends Error {}
+
+function externallyCancelled(budget) {
+  return budget.signal.aborted && !(budget.signal.reason instanceof ProviderDeadline);
+}
+
+function interruptionReason(budget) {
+  return externallyCancelled(budget) ? 'execution cancelled' : 'provider deadline reached';
+}
 
 function deadlineReached({ signal, expiresAt }) {
   return signal.aborted || performance.now() >= expiresAt;
@@ -228,7 +242,7 @@ async function verifyCandidate({ providers, approval, profile, revision, report,
         result = await callProvider(providers[stage].run, args, budget);
       } while (result?.status === 'PENDING' && result.revision === revision && reads < maxReads);
     } catch (error) {
-      if (!github || !(budget.signal.aborted || error instanceof ProviderDeadline)) throw error;
+      if (!github || externallyCancelled(budget) || !(budget.signal.aborted || error instanceof ProviderDeadline)) throw error;
       result = { status: 'BLOCKED', revision, reason: 'GitHub evidence read deadline reached' };
     }
     const findings = result?.status === 'FAIL' ? compactFindings(result.findings, stage, approval.requiredChecks) : [];
@@ -256,7 +270,7 @@ async function verifyCandidate({ providers, approval, profile, revision, report,
 /** Run one approved issue with durable deduplication. Only injected simulations can dispatch. */
 export async function runIssueLoop({
   profile, approval, evidence, providers = {}, stateDirectory, realExecution = false,
-  timeoutMs = 120_000, pollIntervalMs = 1_000, githubEvidenceFetch,
+  timeoutMs = 120_000, pollIntervalMs = 1_000, githubEvidenceFetch, signal, codexSimulation,
 } = {}) {
   const report = {
     schema_version: 'factory.issue_run_report.v1',
@@ -272,12 +286,17 @@ export async function runIssueLoop({
     owner_gate: null,
     next_action: null,
   };
+  if (!validMemoryScope(profile?.memory_scope)) {
+    return finish(report, 'BLOCKED', 'missing or invalid issue profile approval: memory_scope is missing or invalid');
+  }
   if (!approvedProfile(profile, approval)) return finish(report, 'BLOCKED', 'missing or invalid issue profile approval');
   if (typeof stateDirectory !== 'string' || !isAbsolute(stateDirectory) ||
       !Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 120_000 ||
-      !Number.isInteger(pollIntervalMs) || pollIntervalMs < 0 || pollIntervalMs > 5_000) {
+      !Number.isInteger(pollIntervalMs) || pollIntervalMs < 0 || pollIntervalMs > 5_000 ||
+      (signal !== undefined && !(signal instanceof AbortSignal))) {
     return finish(report, 'BLOCKED', 'an absolute state directory and bounded timing options are required');
   }
+  if (signal?.aborted) return finish(report, 'BLOCKED', 'execution cancelled');
 
   profile = structuredClone(Object.fromEntries(PROFILE_FIELDS.map((key) => [key, profile[key]])));
   const { profileDigest, repository, environment, baseline, requiredChecks, githubPullRequest } = approval;
@@ -288,6 +307,22 @@ export async function runIssueLoop({
   report.run_id = hash([approval.repository.toLowerCase(), report.issue_key, report.mode]);
   const inputs = [approval.profileDigest, approval.environment, approval.baseline, approval.requiredChecks];
   if (githubProviders) inputs.push(githubPullRequest, githubProviders.ci.mode);
+  const simulateCodex = realExecution === false && codexSimulation !== undefined;
+  const workspace = simulateCodex ? codexSimulation?.workspace : undefined;
+  if (simulateCodex && (typeof workspace !== 'string' || !isAbsolute(workspace))) {
+    return finish(report, 'BLOCKED', 'an absolute workspace is required for Codex simulation');
+  }
+  let runCodex;
+  if (simulateCodex) {
+    const { spawnFixture, allowedWorkspaces, runtimeIsolation, mcpAccess } = codexSimulation;
+    runCodex = createCodexCliAdapter({
+      simulation: true, spawnFixture, allowedWorkspaces: Array.isArray(allowedWorkspaces) ? [...allowedWorkspaces] : [],
+      runtimeIsolation: { verified: runtimeIsolation?.verified },
+      mcpAccess: { verified: mcpAccess?.verified, allowed: mcpAccess?.allowed },
+      timeoutMs,
+    });
+    inputs.push('codex-cli-simulation', workspace);
+  }
   const fingerprint = hash(inputs);
   const directory = join(stateDirectory, report.run_id);
   const save = (current) => persist(directory, { fingerprint, report: current });
@@ -313,9 +348,6 @@ export async function runIssueLoop({
   }
 
   function executionBlock(current) {
-    if (realExecution !== false) {
-      return finish(current, 'BLOCKED', 'live dispatch is disabled pending verified write isolation, CI access and independent review');
-    }
     const admission = prepareOfflineIssue({
       issue: { issueKey: current.issue_key, environment: approval.environment, autoMergeRequested: false },
       evidence,
@@ -328,6 +360,14 @@ export async function runIssueLoop({
         !profile.dependencies.every((key) => dependencies.some((dependency) => dependency?.key === key))) {
       return finish(current, 'BLOCKED', 'preflight evidence does not match the approved repository, baseline or issue dependencies');
     }
+    if (realExecution !== false) {
+      const credentialBlock = hasGitHubEvidenceCredential(approval.repository) ? ''
+        : '. Missing GitHub Actions job token for the approved repository';
+      return finish(current, 'BLOCKED', 'live dispatch requires verified write isolation, process containment, credential separation and permissions' + credentialBlock);
+    }
+    if (simulateCodex && githubProviders?.ci.mode === 'LIVE') {
+      return finish(current, 'BLOCKED', 'Codex process simulation requires simulated GitHub evidence');
+    }
     if (!providers || !validProviders(providers, profile, githubProviders)) {
       return finish(current, 'BLOCKED', 'required providers or independent reviewer are unavailable');
     }
@@ -336,8 +376,8 @@ export async function runIssueLoop({
 
   async function withBudget(run) {
     const abort = new AbortController();
-    const budget = { signal: abort.signal, expiresAt: performance.now() + timeoutMs };
-    const timeout = setTimeout(() => abort.abort(), timeoutMs);
+    const budget = { signal: signal ? AbortSignal.any([signal, abort.signal]) : abort.signal, expiresAt: performance.now() + timeoutMs };
+    const timeout = setTimeout(() => abort.abort(new ProviderDeadline()), timeoutMs);
     try {
       return await run(budget);
     } finally {
@@ -350,7 +390,7 @@ export async function runIssueLoop({
     const outcome = await executeRepairCycles({
       previousFailure,
       beforeAttempt: async (cycle) => {
-        if (deadlineReached(budget)) return { status: 'BLOCKED', reason: 'provider deadline reached' };
+        if (deadlineReached(budget)) return { status: 'BLOCKED', reason: interruptionReason(budget) };
         report.status = 'RUNNING';
         report.owner_gate = null;
         report.next_action = null;
@@ -362,22 +402,50 @@ export async function runIssueLoop({
       performAttempt: async ({ cycle, findings }) => {
         const attempt = report.attempts.at(-1);
         try {
-          const coded = await callProvider(providers.coding.run, {
+          const input = {
             issueKey: report.issue_key, repository: approval.repository, runId: report.run_id, cycle,
             baseRevision: report.revision ?? approval.baseline, model: profile.model,
             requirements: profile.requirements, acceptanceTests: profile.acceptance_tests,
             forbiddenOperations: profile.forbidden_operations, memoryScope: profile.memory_scope, findings,
-          }, budget);
+          };
+          if (runCodex) {
+            if (deadlineReached(budget)) return { status: 'BLOCKED', reason: interruptionReason(budget) };
+            // Await the adapter's termination result even when the shared budget expires.
+            const dispatched = await runCodex({ environment: approval.environment }, {
+              workspace, signal: budget.signal, prompt: JSON.stringify(input),
+            });
+            const { eventCount, exitCode, timedOut, cancelled, closeConfirmed } = dispatched.evidence;
+            const budgetExpired = cancelled && budget.signal.reason instanceof ProviderDeadline;
+            attempt.dispatch = {
+              mode: 'SIMULATION', issue_key: input.issueKey, repository: input.repository,
+              approval_digest: approval.profileDigest, base_revision: input.baseRevision,
+              candidate_revision: null, status: dispatched.status,
+              event_count: eventCount, exit_code: Number.isInteger(exitCode) ? exitCode : null, close_confirmed: closeConfirmed,
+              timed_out: timedOut || budgetExpired, cancelled: cancelled && !budgetExpired,
+            };
+            if (dispatched.status !== 'PASS') {
+              const reason = budgetExpired
+                ? dispatched.reason.replace('execution cancelled', 'execution timed out') : dispatched.reason;
+              attempt.dispatch.reason = reason;
+              return { status: 'BLOCKED', reason };
+            }
+          }
+          const coded = await callProvider(providers.coding.run, input, budget);
           if (coded?.status === 'GATE_A') return { status: 'GATE_A', reason: 'coding reported a scope, security or permission boundary' };
+          if (runCodex && (coded?.issueKey !== input.issueKey || coded.repository !== input.repository ||
+              coded.baseRevision !== input.baseRevision)) {
+            return { status: 'BLOCKED', reason: 'coding candidate does not match the dispatched issue, repository or base revision' };
+          }
           if (coded?.status !== 'PASS' || typeof coded.revision !== 'string' ||
               !SHA.test(coded.revision) || revisions.has(coded.revision)) {
             return { status: 'BLOCKED', reason: 'coding provider did not return a new candidate revision' };
           }
           revisions.add(coded.revision);
           report.revision = attempt.revision = coded.revision;
+          if (attempt.dispatch) attempt.dispatch.candidate_revision = coded.revision;
           return await verifyCandidate({ providers, approval, profile, revision: coded.revision, report, cycle, budget, pollIntervalMs });
         } catch (error) {
-          const reason = budget.signal.aborted || error instanceof ProviderDeadline ? 'provider deadline reached' : 'provider invocation failed';
+          const reason = budget.signal.aborted || error instanceof ProviderDeadline ? interruptionReason(budget) : 'provider invocation failed';
           return { status: 'BLOCKED', reason };
         }
       },
@@ -412,9 +480,11 @@ export async function runIssueLoop({
           stages: ['ci', 'review'], ciReads: 1,
         });
       } catch {
+        if (externallyCancelled(budget)) return null;
         return finish({ ...current, reviewer: { profile: providers.review.principal, verdict: 'UNKNOWN' } },
           'BLOCKED', 'GitHub evidence could not be revalidated');
       }
+      if (externallyCancelled(budget)) return null;
       current.reviewer = {
         profile: providers.review.principal,
         verdict: current.checks.find((check) => check.cycle === cycle && check.stage === 'review')?.status ?? 'UNKNOWN',

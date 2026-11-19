@@ -101,15 +101,23 @@ function verifyReview(pr, revision, nowMs) {
   return { status: 'PASS', details };
 }
 
+function actionsJobToken(repository) {
+  const { GITHUB_ACTIONS, GITHUB_REPOSITORY, GITHUB_TOKEN, GH_TOKEN } = process.env;
+  return GITHUB_ACTIONS === 'true' && sameRepo(GITHUB_REPOSITORY, repository) ? GITHUB_TOKEN || GH_TOKEN : undefined;
+}
+
+export function hasGitHubEvidenceCredential(repository) {
+  return Boolean(actionsJobToken(repository));
+}
+
 function createGitHubEvidenceClient(fetchImpl) {
   const mode = fetchImpl === undefined ? 'LIVE' : 'SIMULATION';
   const request = mode === 'LIVE' ? globalThis.fetch : fetchImpl;
   const source = mode === 'LIVE' ? 'github.com:read-only' : 'fixture:github-api';
 
   async function read(endpoint, { repository, signal, query, variables }) {
-    const { GITHUB_ACTIONS, GITHUB_REPOSITORY, GITHUB_TOKEN, GH_TOKEN } = process.env;
-    const token = GITHUB_TOKEN || GH_TOKEN;
-    if (mode === 'LIVE' && (GITHUB_ACTIONS !== 'true' || !sameRepo(GITHUB_REPOSITORY, repository) || !token)) {
+    const token = mode === 'LIVE' ? actionsJobToken(repository) : undefined;
+    if (mode === 'LIVE' && !token) {
       return { ok: false, reason: 'missing GitHub Actions job token for the approved repository' };
     }
     const headers = { accept: 'application/vnd.github+json', 'x-github-api-version': '2022-11-28' };
