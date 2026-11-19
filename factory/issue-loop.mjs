@@ -166,7 +166,12 @@ async function replay(directory, fingerprint, report, recheck) {
       stored.report = current;
       await persist(directory, stored);
     };
-    await save(await recheck(stored.report, save));
+    const refreshed = await recheck(stored.report, save);
+    if (refreshed === null) {
+      // Retain the prior verification and the refresh cooldown for the next replay.
+      return finish(stored.report, 'BLOCKED', 'execution cancelled during GitHub evidence refresh');
+    }
+    await save(refreshed);
     return stored.report;
   } finally {
     await rmdir(lock);
@@ -475,9 +480,11 @@ export async function runIssueLoop({
           stages: ['ci', 'review'], ciReads: 1,
         });
       } catch {
+        if (externallyCancelled(budget)) return null;
         return finish({ ...current, reviewer: { profile: providers.review.principal, verdict: 'UNKNOWN' } },
-          'BLOCKED', externallyCancelled(budget) ? 'execution cancelled' : 'GitHub evidence could not be revalidated');
+          'BLOCKED', 'GitHub evidence could not be revalidated');
       }
+      if (externallyCancelled(budget)) return null;
       current.reviewer = {
         profile: providers.review.principal,
         verdict: current.checks.find((check) => check.cycle === cycle && check.stage === 'review')?.status ?? 'UNKNOWN',

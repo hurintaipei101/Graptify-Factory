@@ -713,6 +713,128 @@ test('concurrent evidence replays share a durable refresh limit and never dispat
   assert.equal(calls.length, 11);
 });
 
+test('cancelling CI or review refresh preserves the durable report and permits an identical retry', async (t) => {
+  const cases = [
+    { stage: 'CI', endpoint: '/check-runs', initialStatus: 'READY' },
+    { stage: 'review', endpoint: '/graphql', initialStatus: 'BLOCKED' },
+  ];
+  for (const { stage, endpoint, initialStatus } of cases) {
+    await t.test(stage, { timeout: 10_000 }, async (t) => {
+      const options = await fixture(t);
+      let now = Date.now();
+      t.mock.method(Date, 'now', () => now);
+      let phase = 'initial';
+      let dispatches = 0;
+      let tests = 0;
+      let entered = Promise.withResolvers();
+      let release = Promise.withResolvers();
+      const coding = options.providers.coding.run;
+      options.providers.coding.run = (input) => {
+        dispatches += 1;
+        assert.deepEqual(input.memoryScope, options.profile.memory_scope);
+        return coding(input);
+      };
+      options.providers.tests.run = (input) => { tests += 1; return pass(input); };
+      const calls = githubFixture(options, async ({ path, review }) => {
+        if (phase === 'initial' && initialStatus === 'BLOCKED') {
+          review.state = 'PENDING';
+          review.submittedAt = null;
+        }
+        if (phase !== 'initial' && path.endsWith(endpoint)) {
+          entered.resolve();
+          await release.promise;
+        }
+      });
+      const initial = await runIssueLoop(options);
+      assert.equal(initial.status, initialStatus);
+      const statePath = join(options.stateDirectory, initial.run_id, 'state.json');
+      const before = JSON.parse(await readFile(statePath, 'utf8'));
+
+      phase = 'cancel';
+      now += 60_000;
+      const controller = new AbortController();
+      const active = runIssueLoop({ ...options, signal: controller.signal });
+      await entered.promise;
+      controller.abort();
+      let cancelled;
+      try {
+        cancelled = await active;
+      } finally {
+        release.resolve();
+      }
+      assert.equal(cancelled.status, 'BLOCKED');
+      assert.match(cancelled.next_action, /execution cancelled/);
+      const after = JSON.parse(await readFile(statePath, 'utf8'));
+      assert.equal(after.githubRefreshStartedAt, now);
+      assert.equal(after.fingerprint, before.fingerprint);
+      assert.deepEqual(after.report, before.report);
+      const readsAfterCancel = calls.length;
+      assert.equal((await runIssueLoop(options)).status, 'BLOCKED');
+      assert.equal(calls.length, readsAfterCancel);
+
+      phase = 'retry';
+      now += 5_000;
+      entered = Promise.withResolvers();
+      release = Promise.withResolvers();
+      const retry = runIssueLoop(options);
+      await entered.promise;
+      try {
+        const concurrent = await runIssueLoop(options);
+        assert.equal(concurrent.status, 'BLOCKED');
+        assert.match(concurrent.next_action, /refresh is active/);
+      } finally {
+        release.resolve();
+      }
+      const ready = await retry;
+      assert.equal(ready.status, 'READY');
+      assert.equal(ready.issue_key, initial.issue_key);
+      assert.equal(ready.run_id, initial.run_id);
+      assert.equal(ready.revision, initial.revision);
+      assert.equal(ready.repair_cycles, initial.repair_cycles);
+      assert.deepEqual(ready.attempts, initial.attempts);
+      assert.equal(calls.length, readsAfterCancel + 3);
+      assert.equal(dispatches, 1);
+      assert.equal(tests, 1);
+      assert.equal(JSON.parse(await readFile(statePath, 'utf8')).fingerprint, before.fingerprint);
+    });
+  }
+});
+
+test('retry after a cancelled refresh blocks invalid, stale, or unauthorized evidence', async (t) => {
+  const cases = [
+    ['invalid SHA', ({ restPr }) => { restPr.head.sha = 'invalid'; }, /candidate head/],
+    ['stale CI', ({ run }) => { run.completed_at = '2020-01-01T00:00:00Z'; }, /stale or invalid completion/],
+    ['untrusted CI app', ({ run }) => { run.app.id = 17; }, /unverified GitHub Actions provenance/],
+    ['denied review', ({ path }) => path === '/graphql' ? 403 : undefined, /HTTP 403/],
+  ];
+  for (const [name, invalidate, reason] of cases) {
+    await t.test(name, async (t) => {
+      const options = await fixture(t);
+      let now = Date.now();
+      t.mock.method(Date, 'now', () => now);
+      const controller = new AbortController();
+      let phase = 'initial';
+      githubFixture(options, (response) => {
+        if (phase === 'cancel' && response.path === '/graphql') controller.abort();
+        if (phase === 'retry') return invalidate(response);
+      });
+      const initial = await runIssueLoop(options);
+      assert.equal(initial.status, 'READY');
+      phase = 'cancel';
+      const cancelled = await runIssueLoop({ ...options, signal: controller.signal });
+      assert.match(cancelled.next_action, /execution cancelled/);
+      phase = 'retry';
+      now += 5_000;
+      const retry = await runIssueLoop(options);
+      assert.equal(retry.status, 'BLOCKED');
+      assert.match(retry.next_action, reason);
+      assert.equal(retry.revision, initial.revision);
+      assert.equal(retry.repair_cycles, initial.repair_cycles);
+      assert.deepEqual(retry.attempts, initial.attempts);
+    });
+  }
+});
+
 test('runs targeted test, CI and independent review repairs and replays persisted evidence', async (t) => {
   const options = await fixture(t);
   const prompts = [];
