@@ -10,19 +10,55 @@ const statuses = new Set(['PASS', 'FAIL', 'BLOCKED']);
 const sha = (value) => typeof value === 'string' && /^[a-f0-9]{40}$/.test(value);
 const status = (value) => statuses.has(value) ? value : 'BLOCKED';
 
-function trustedMain(env) {
+async function verifyCurrentMain(env) {
+  const compared = {
+    dispatched_sha: sha(env.GITHUB_SHA) ? env.GITHUB_SHA : null,
+    checked_out_sha: null,
+    current_main_sha: null,
+  };
+  const result = (status, reason_code) => ({ status, reason_code, ...compared });
   if (env.GITHUB_ACTIONS !== 'true' || env.RUNNER_ENVIRONMENT !== 'github-hosted' ||
       env.GITHUB_EVENT_NAME !== 'workflow_dispatch' || env.GITHUB_REF !== 'refs/heads/main' ||
-      env.GITHUB_REPOSITORY !== target.repository || !sha(env.GITHUB_SHA) ||
-      env.GITHUB_SHA !== env.GITHUB_WORKFLOW_SHA) return false;
-  try {
-    const git = (...args) => execFileSync('git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
-    if (git('rev-parse', 'HEAD') !== env.GITHUB_SHA) return false;
-    git('merge-base', '--is-ancestor', target.mergeCommit, env.GITHUB_SHA);
-    return true;
-  } catch {
-    return false;
+      env.GITHUB_REPOSITORY !== target.repository || !compared.dispatched_sha ||
+      compared.dispatched_sha !== env.GITHUB_WORKFLOW_SHA) {
+    return result('BLOCKED', 'DISPATCH_IDENTITY_UNVERIFIED');
   }
+  try {
+    const checkedOut = execFileSync('git', ['rev-parse', '--verify', 'HEAD'], {
+      encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'pipe'],
+    }).trim();
+    if (sha(checkedOut)) compared.checked_out_sha = checkedOut;
+  } catch {
+    return result('BLOCKED', 'CHECKOUT_UNVERIFIED');
+  }
+  if (!compared.checked_out_sha) return result('BLOCKED', 'CHECKOUT_UNVERIFIED');
+  if (compared.checked_out_sha !== compared.dispatched_sha) return result('FAIL', 'CHECKOUT_SHA_MISMATCH');
+  if (!env.GITHUB_TOKEN?.trim()) return result('BLOCKED', 'MAIN_LOOKUP_TOKEN_MISSING');
+
+  try {
+    const response = await fetch(`https://api.github.com/repos/${target.repository}/git/ref/heads/main`, {
+      headers: {
+        accept: 'application/vnd.github+json',
+        authorization: `Bearer ${env.GITHUB_TOKEN}`,
+        'cache-control': 'no-cache',
+        'x-github-api-version': '2022-11-28',
+      },
+      redirect: 'error',
+      cache: 'no-store',
+      signal: AbortSignal.timeout(10_000),
+    });
+    if ([401, 403, 404].includes(response.status)) return result('BLOCKED', 'MAIN_LOOKUP_DENIED_OR_UNAVAILABLE');
+    if (!response.ok) return result('BLOCKED', 'MAIN_LOOKUP_FAILED');
+    const ref = await response.json();
+    if (ref?.ref !== 'refs/heads/main' || ref.object?.type !== 'commit' || !sha(ref.object.sha)) {
+      return result('BLOCKED', 'MAIN_RESPONSE_UNVERIFIED');
+    }
+    compared.current_main_sha = ref.object.sha;
+  } catch {
+    return result('BLOCKED', 'MAIN_LOOKUP_FAILED');
+  }
+  return compared.current_main_sha === compared.dispatched_sha
+    ? result('PASS', 'CURRENT_MAIN_VERIFIED') : result('FAIL', 'CURRENT_MAIN_SHA_MISMATCH');
 }
 
 export async function verifyHandoff(candidateSha, read = observeMergedGitHubEvidence) {
@@ -68,27 +104,36 @@ function parseControls(serialized) {
 }
 
 async function main(env, mode) {
-  const trusted = trustedMain(env);
+  const admission = await verifyCurrentMain(env);
+  const admitted = admission.status === 'PASS';
   const output = (key, value) => appendFileSync(env.GITHUB_OUTPUT, `${key}=${value}\n`);
   if (mode === 'worker') {
-    const worker = trusted ? await observeWorkerIsolation(target.revision) : { controls: blockedWorker() };
+    // The short-lived read token belongs to the host admission check only.
+    delete env.GITHUB_TOKEN;
+    console.log(JSON.stringify({ main_verification: admission }));
+    const worker = admitted ? await observeWorkerIsolation(target.revision) : { controls: blockedWorker() };
     output('controls', JSON.stringify(worker.controls));
     if (worker.candidate_sha) output('candidate_sha', worker.candidate_sha);
     return;
   }
   if (mode === 'denied') {
-    const result = trusted && env.GITHUB_TOKEN ? await observeMergedGitHubEvidence(target) : {};
+    console.log(JSON.stringify({ main_verification: admission }));
+    const result = admitted ? await observeMergedGitHubEvidence(target) : {};
     output('permission_negative', permissionNegative(result));
     return;
   }
   if (mode !== 'report') throw new Error('Unknown smoke mode');
 
-  const worker = trusted ? parseControls(env.WORKER_CONTROLS) : blockedWorker();
-  const handoff = await verifyHandoff(trusted && env.GITHUB_TOKEN &&
-    worker.credentials === 'PASS' && worker.workspace === 'PASS' ? env.WORKER_CANDIDATE_SHA : undefined);
+  const worker = admitted ? parseControls(env.WORKER_CONTROLS) : blockedWorker();
+  let handoff = await verifyHandoff(admitted && worker.credentials === 'PASS' && worker.workspace === 'PASS'
+    ? env.WORKER_CANDIDATE_SHA : undefined);
+  // Recheck after the GitHub evidence reads so a concurrent main update cannot bless stale evidence.
+  const recording = admitted ? await verifyCurrentMain(env) : admission;
+  const trusted = recording.status === 'PASS';
+  if (!trusted) handoff = await verifyHandoff(undefined);
   const controls = {
-    trusted_main: trusted ? 'PASS' : 'BLOCKED',
-    ...worker,
+    trusted_main: recording.status,
+    ...(trusted ? worker : blockedWorker()),
     ...handoff.controls,
     invalid_permissions_negative: trusted && handoff.controls.github_permissions === 'PASS' ? status(env.PERMISSION_NEGATIVE) : 'BLOCKED',
     github_job_cancellation: 'BLOCKED',
@@ -97,7 +142,8 @@ async function main(env, mode) {
     schema: 'factory.isolation_smoke.v1',
     mode: trusted ? 'LIVE' : 'UNVERIFIED',
     repository: target.repository,
-    workflow_sha: trusted ? env.GITHUB_SHA : null,
+    workflow_sha: trusted ? recording.dispatched_sha : null,
+    main_verification: recording,
     run_id: /^\d+$/.test(env.GITHUB_RUN_ID) ? env.GITHUB_RUN_ID : null,
     run_attempt: /^\d+$/.test(env.GITHUB_RUN_ATTEMPT) ? env.GITHUB_RUN_ATTEMPT : null,
     realExecution: false,

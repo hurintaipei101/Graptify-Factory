@@ -67,7 +67,7 @@ Each simulated dispatch uses the existing issue claim and repair budget. The opt
 
 ### F2-09B LIVE-02 isolation smoke
 
-The **Safe Coding Dispatch Isolation Smoke** workflow is a manual dispatch on this repository's `main`. It checks out the triggering main SHA and runs a fixed Node 22 probe from that revision in a disposable Linux container. The worker never downloads PR source. The separate evidence job reads the historical PR #4 candidate using the existing GitHub evidence reader. The smoke bypasses the issue loop and leaves `realExecution: false` and `authorization: BLOCKED`.
+The **Safe Coding Dispatch Isolation Smoke** workflow is a manual dispatch on this repository's `main`. It checks the dispatch and checkout SHA against the current main head through the authenticated GitHub refs API before running the fixed Node 22 probe. The report job repeats the check after reading GitHub evidence. Stale runs and failed trust checks produce unverified evidence with the compared SHAs and a reason code. The worker never downloads PR source. The separate evidence job reads the historical PR #4 candidate using the existing GitHub evidence reader. The smoke bypasses the issue loop and leaves `realExecution: false` and `authorization: BLOCKED`.
 
 Download `isolation-evidence.json` from the run or read the same report in the run summary. It includes the workflow SHA, run and attempt IDs, status per control, and sanitized GitHub evidence when available. A failure or blocked control keeps the run unsuccessful. Missing prerequisites also leave affected controls blocked.
 
