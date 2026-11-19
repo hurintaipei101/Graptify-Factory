@@ -19,7 +19,11 @@ async function verifiedWorkspace(workspace, allowedWorkspaces) {
   return resolved;
 }
 function parseJsonl(text, limits) {
-  let bytes = 0; const events = []; let lastEventType = null;
+  let bytes = 0;
+  let eventCount = 0;
+  let lastEventType = null;
+  let turnCompleted = false;
+  let turnFailed = false;
   for (const line of text.split(/\r?\n/)) {
     if (!line.trim()) continue;
     bytes += Buffer.byteLength(line);
@@ -27,10 +31,12 @@ function parseJsonl(text, limits) {
     if (Buffer.byteLength(line) > limits.maxEventBytes) throw new Error('JSONL event exceeds bounded memory limit');
     let event; try { event = JSON.parse(line); } catch { throw new Error('malformed JSONL event'); }
     if (!event || typeof event !== 'object' || Array.isArray(event)) throw new Error('JSONL event must be an object');
-    if (events.length < limits.maxEvents) events.push(event);
+    if (eventCount < limits.maxEvents) eventCount += 1;
     lastEventType = typeof event.type === 'string' ? event.type : null;
+    if (lastEventType === 'turn.completed') turnCompleted = true;
+    if (lastEventType === 'turn.failed') turnFailed = true;
   }
-  return { eventCount: events.length, lastEventType, events };
+  return { eventCount, lastEventType, turnCompleted, turnFailed };
 }
 
 /** Create a bounded, injectable adapter. Real execution is opt-in and isolation is fail-closed. */
@@ -65,7 +71,10 @@ export function createCodexCliAdapter(options = {}) {
         if (settled) return;
         let parsed; try { parsed = parseJsonl(stdout, limits); } catch (error) { finish(fail(error.message, { exitCode, signal })); return; }
         const evidence = { ...parsed, exitCode, signal, stderr: stderr.slice(0, 512) };
-        finish(exitCode === 0 ? { status: 'PASS', passed: true, evidence: compactEvidence(evidence) } : fail(`Codex CLI exited with code ${exitCode}`, evidence));
+        if (exitCode !== 0) return finish(fail(`Codex CLI exited with code ${exitCode}`, evidence));
+        if (parsed.turnFailed) return finish(fail('Codex CLI reported turn.failed', evidence));
+        if (!parsed.turnCompleted) return finish(fail('Codex CLI did not report turn.completed', evidence));
+        finish({ status: 'PASS', passed: true, evidence: compactEvidence(evidence) });
       });
     });
   };
