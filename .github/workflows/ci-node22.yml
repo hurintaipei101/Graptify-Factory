@@ -1,0 +1,34 @@
+﻿name: Node 22 CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Node 22 Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          package-manager-cache: false
+
+      - name: Verify Node and run Factory tests
+        shell: bash
+        run: |
+          node --version
+          node -e "if (process.versions.node.split('.')[0] !== '22') process.exit(1)"
+          node --test factory/*.test.mjs
