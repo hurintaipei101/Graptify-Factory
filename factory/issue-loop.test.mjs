@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm, unlink, writeFile } from 'node:fs/promises';
+import { EventEmitter } from 'node:events';
+import { mkdir, mkdtemp, readFile, rm, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -16,8 +17,11 @@ const pass = ({ revision }) => ({ status: 'PASS', revision });
 const failure = (revision, id) => ({ status: 'FAIL', revision, findings: [{ id, summary: 'Fix the failing assertion' }] });
 
 async function fixture(t) {
-  const stateDirectory = await mkdtemp(join(tmpdir(), 'factory-loop-'));
-  t.after(() => rm(stateDirectory, { recursive: true, force: true }));
+  const directory = await mkdtemp(join(tmpdir(), 'factory-loop-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const stateDirectory = join(directory, 'state');
+  const workspace = join(directory, 'worker');
+  await Promise.all([mkdir(stateDirectory), mkdir(workspace)]);
   const timestamp = new Date().toISOString();
   const profile = JSON.parse(await readFile(new URL('./contracts/issue_execution_profile.example.json', import.meta.url), 'utf8'));
   profile.architecture_revision = 'approved-v1';
@@ -42,8 +46,154 @@ async function fixture(t) {
     ci: provider('read-only', 'github-fixture', pass),
     review: provider('agent', 'reviewer', (input) => pass(input)),
   };
-  return { profile, approval, evidence, providers, stateDirectory, pollIntervalMs: 0 };
+  return { profile, approval, evidence, providers, stateDirectory, workspace, pollIntervalMs: 0 };
 }
+
+function codexFixture(options, spawn) {
+  const { workspace } = options;
+  options.codexSimulation = {
+    workspace, allowedWorkspaces: [workspace], runtimeIsolation: { verified: true },
+    mcpAccess: { verified: true, allowed: true }, spawnFixture: spawn,
+  };
+  options.providers.coding.run = ({ issueKey, repository, baseRevision, cycle }) =>
+    ({ issueKey, repository, baseRevision, status: 'PASS', revision: candidate(cycle) });
+}
+
+function codexChild() {
+  const process = new EventEmitter();
+  process.stdout = new EventEmitter();
+  process.stderr = new EventEmitter();
+  process.kill = () => process.emit('close', null, 'SIGTERM');
+  return process;
+}
+
+function successfulCodexChild() {
+  const process = codexChild();
+  queueMicrotask(() => {
+    process.stdout.emit('data', Buffer.from('{"type":"turn.completed","secret":"do not retain"}\n'));
+    process.emit('close', 0, null);
+  });
+  return process;
+}
+
+test('approved Codex simulation persists compact evidence for the issue and candidate', async (t) => {
+  const options = await fixture(t);
+  codexFixture(options, ({ command, args, options: launch }) => {
+    assert.equal(command, 'codex');
+    assert.deepEqual(args.slice(0, 4), ['exec', '--json', '--sandbox', 'read-only']);
+    const prompt = JSON.parse(args.at(-1));
+    assert.equal(prompt.issueKey, options.profile.issue_key);
+    assert.equal(prompt.baseRevision, baseline);
+    assert.deepEqual(prompt.memoryScope, options.profile.memory_scope);
+    assert.deepEqual(Object.keys(launch.env).sort(), ['CODEX_HOME', 'HOME', 'PATH']);
+    return successfulCodexChild();
+  });
+  const report = await runIssueLoop(options);
+  assert.equal(report.status, 'READY');
+  assert.deepEqual(report.attempts[0].dispatch, {
+    mode: 'SIMULATION', issue_key: options.profile.issue_key, repository,
+    approval_digest: options.approval.profileDigest, base_revision: baseline, candidate_revision: candidate(0),
+    status: 'PASS', event_count: 1, exit_code: 0, close_confirmed: true, timed_out: false, cancelled: false,
+  });
+  assert.ok(!JSON.stringify(report).includes('do not retain'));
+  const stored = JSON.parse(await readFile(join(options.stateDirectory, report.run_id, 'state.json'), 'utf8'));
+  assert.deepEqual(stored.report, report);
+});
+
+test('dispatch blocks unsigned scope, invalid memory, and missing isolation or credentials', async (t) => {
+  const cases = [
+    ['unsigned scope', (o) => { o.profile.requirements.push('unsigned'); }, /profile approval/],
+    ['missing memory', (o) => { delete o.profile.memory_scope; o.approval.profileDigest = issueProfileDigest(o.profile); }, /memory_scope/],
+    ['invalid memory', (o) => { o.profile.memory_scope.allow_customer_data = 'false'; o.approval.profileDigest = issueProfileDigest(o.profile); }, /memory_scope/],
+    ['missing isolation', (o) => { delete o.codexSimulation.runtimeIsolation; }, /isolation is not verified/],
+    ['missing MCP permissions', (o) => { delete o.codexSimulation.mcpAccess; }, /MCP access is not verified/],
+    ['missing live credential', (o) => { o.realExecution = true; }, /Missing GitHub Actions job token/],
+    ['live GitHub evidence', (o) => { o.approval.githubPullRequest = pullRequest; }, /requires simulated GitHub evidence/],
+  ];
+  for (const [name, change, reason] of cases) {
+    await t.test(name, async (t) => {
+      const options = await fixture(t);
+      let calls = 0;
+      codexFixture(options, () => { calls += 1; return successfulCodexChild(); });
+      change(options);
+      const result = await runIssueLoop(options);
+      assert.equal(result.status, 'BLOCKED');
+      assert.match(result.next_action, reason);
+      assert.equal(calls, 0);
+    });
+  }
+});
+
+test('candidate provenance must match the dispatch before any verification runs', async (t) => {
+  for (const [field, value] of [['issueKey', 'F2-99'], ['repository', 'other/factory'], ['baseRevision', candidate(1)]]) {
+    await t.test(field, async (t) => {
+      const options = await fixture(t);
+      codexFixture(options, successfulCodexChild);
+      const coding = options.providers.coding.run;
+      options.providers.coding.run = (input) => ({ ...coding(input), [field]: value });
+      options.providers.tests.run = () => assert.fail('must not verify an unrelated candidate');
+      const result = await runIssueLoop(options);
+      assert.equal(result.status, 'BLOCKED');
+      assert.match(result.next_action, /candidate does not match/);
+      assert.equal(result.attempts[0].dispatch.candidate_revision, null);
+      assert.deepEqual(result.checks, []);
+    });
+  }
+});
+
+for (const [trigger, reason] of [['cancellation', /cancelled/], ['timeout', /timed out/], ['process error', /process error/], ['stderr overflow', /output exceeds/]]) {
+  test(`Codex ${trigger} waits for cleanup and retains the durable claim`, async (t) => {
+    const options = await fixture(t);
+    const controller = new AbortController();
+    options.signal = controller.signal;
+    options.timeoutMs = 500;
+    const signals = [];
+    let dispatchStarted;
+    const started = new Promise((resolve) => { dispatchStarted = resolve; });
+    codexFixture(options, () => {
+      const process = codexChild();
+      process.kill = (signal) => {
+        signals.push(signal);
+        setTimeout(() => process.emit('close', null, signal), 10);
+      };
+      if (trigger === 'process error') queueMicrotask(() => process.emit('error', new Error('private detail')));
+      if (trigger === 'stderr overflow') queueMicrotask(() => process.stderr.emit('data', Buffer.alloc(33_000)));
+      dispatchStarted();
+      return process;
+    });
+    const running = runIssueLoop(options);
+    await started;
+    const concurrent = await runIssueLoop(options);
+    assert.equal(concurrent.status, 'BLOCKED');
+    if (trigger === 'cancellation') controller.abort();
+    const report = await running;
+    assert.equal(report.status, 'BLOCKED');
+    assert.match(report.next_action, reason);
+    assert.deepEqual(signals, ['SIGTERM']);
+    const { dispatch } = report.attempts[0];
+    assert.equal(dispatch.close_confirmed, true);
+    assert.equal(dispatch.cancelled, trigger === 'cancellation');
+    assert.equal(dispatch.timed_out, trigger === 'timeout');
+    assert.equal(report.attempts.length, 1);
+    options.codexSimulation.spawnFixture = () => assert.fail('claim must never redispatch');
+    assert.deepEqual(await runIssueLoop({ ...options, signal: undefined }), report);
+  });
+}
+
+test('only the initial Codex dispatch and three repairs can run before Gate A', async (t) => {
+  const options = await fixture(t);
+  const bases = [];
+  codexFixture(options, ({ args }) => {
+    bases.push(JSON.parse(args.at(-1)).baseRevision);
+    return successfulCodexChild();
+  });
+  options.providers.tests.run = ({ revision }) => failure(revision, 'T01');
+  const report = await runIssueLoop(options);
+  assert.equal(report.status, 'GATE_A');
+  assert.equal(report.owner_gate, 'A');
+  assert.equal(report.repair_cycles, 3);
+  assert.deepEqual(bases, [baseline, candidate(0), candidate(1), candidate(2)]);
+});
 
 function githubFixture(options, mutate = () => {}, head = () => candidate(0)) {
   options.approval.githubPullRequest = pullRequest;
