@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { addAbortListener } from 'node:events';
-import { mkdir, open, readFile, rename } from 'node:fs/promises';
+import { mkdir, open, readFile, rename, rmdir } from 'node:fs/promises';
 import { isAbsolute, join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { executeRepairCycles, MAX_REPAIR_CYCLES } from './executor.mjs';
@@ -13,6 +13,20 @@ const REPOSITORY = /^[\w.-]{1,100}\/[\w.-]{1,100}$/;
 const ENVIRONMENTS = new Set(['isolated-worker', 'test', 'staging']);
 const STAGES = ['coding', 'tests', 'ci', 'review'];
 const KINDS = { coding: 'agent', tests: 'deterministic', ci: 'read-only', review: 'agent' };
+const GITHUB_REFRESH_INTERVAL_MS = 5_000;
+// Match the reasons already persisted in issue reports, including reports from before refresh was supported.
+const RECOVERABLE_GITHUB_BLOCKS = new Set([
+  'required GitHub checks are still pending after three reads',
+  'required GitHub checks are still pending',
+  'required GitHub check runs are missing',
+  'required GitHub check has a stale or invalid completion time',
+  'Codex review is pending',
+  'no trusted Codex review is bound to the candidate SHA',
+  'Codex review completion is stale or invalid',
+  'Codex review has no verifiable approval for the candidate SHA',
+  'GitHub API response was unavailable or invalid',
+  'GitHub evidence read deadline reached',
+]);
 const PROFILE_FIELDS = [
   'schema_version', 'issue_key', 'linear_issue_id', 'project', 'module',
   'architecture_revision', 'dependencies', 'role_profile', 'model',
@@ -88,11 +102,33 @@ async function syncDirectory(directory) {
   }
 }
 
+async function readStoredRun(directory) {
+  const stored = JSON.parse(await readFile(join(directory, 'state.json'), 'utf8'));
+  if (!stored?.report?.status) throw new Error('Missing stored report');
+  return stored;
+}
+
+function canRefreshGitHubEvidence(report) {
+  const cycle = report.repair_cycles;
+  const revision = report.revision;
+  const lastAttempt = report.attempts?.at(-1);
+  const checks = report.checks?.filter((check) => check.cycle === cycle && check.revision === revision);
+  if (typeof revision !== 'string' || !SHA.test(revision) || lastAttempt?.revision !== revision ||
+      lastAttempt.cycle !== cycle || !checks?.some((check) => check.stage === 'tests' && check.status === 'PASS')) {
+    return false;
+  }
+  if (report.status === 'READY') return true;
+  const lastCheck = checks.at(-1);
+  return report.status === 'BLOCKED' && lastCheck?.status === 'BLOCKED' &&
+    ['ci', 'review'].includes(lastCheck.stage) &&
+    (RECOVERABLE_GITHUB_BLOCKS.has(report.next_action) ||
+      /^GitHub API request failed \(HTTP (429|5\d\d)\)$/.test(report.next_action));
+}
+
 async function replay(directory, fingerprint, report, recheck) {
   let stored;
   try {
-    stored = JSON.parse(await readFile(join(directory, 'state.json'), 'utf8'));
-    if (!stored?.report?.status) throw new Error('Missing stored report');
+    stored = await readStoredRun(directory);
   } catch {
     return finish(report, 'BLOCKED', 'run is claimed but persisted state is unavailable; reconcile before taking further action');
   }
@@ -100,7 +136,33 @@ async function replay(directory, fingerprint, report, recheck) {
   if (stored.report.status === 'RUNNING') {
     return finish(stored.report, 'BLOCKED', 'run is active or interrupted; reconcile persisted state before taking further action');
   }
-  return recheck && stored.report.status === 'READY' ? recheck(stored.report) : stored.report;
+  if (!recheck || !canRefreshGitHubEvidence(stored.report)) return stored.report;
+
+  const lock = join(directory, 'github-refresh');
+  try {
+    await mkdir(lock, { mode: 0o700 });
+  } catch (error) {
+    if (error.code !== 'EEXIST') throw error;
+    return finish(stored.report, 'BLOCKED', 'GitHub evidence refresh is active or interrupted');
+  }
+  try {
+    // A worker may have refreshed between our first read and acquiring the claim.
+    stored = await readStoredRun(directory);
+    if (stored.fingerprint !== fingerprint) return finish(report, 'BLOCKED', 'issue already claimed with different approved inputs');
+    if (!canRefreshGitHubEvidence(stored.report)) return stored.report;
+    const now = Date.now();
+    if (now - stored.githubRefreshStartedAt < GITHUB_REFRESH_INTERVAL_MS) {
+      return stored.report.status === 'BLOCKED' ? stored.report
+        : finish(stored.report, 'BLOCKED', 'GitHub evidence refresh is rate limited; retry after the refresh interval');
+    }
+    stored.githubRefreshStartedAt = now;
+    await persist(directory, stored);
+    stored.report = await recheck(stored.report);
+    await persist(directory, stored);
+    return stored.report;
+  } finally {
+    await rmdir(lock);
+  }
 }
 
 function validProviders(providers, profile, githubProviders) {
@@ -137,7 +199,7 @@ async function callProvider(run, input, { signal, expiresAt }) {
 }
 
 async function verifyCandidate({ providers, approval, profile, revision, report, cycle, budget, pollIntervalMs,
-  stages = STAGES.slice(1) }) {
+  stages = STAGES.slice(1), ciReads = 3 }) {
   const input = { issueKey: profile.issue_key, repository: approval.repository, revision };
   for (const stage of stages) {
     const args = stage === 'tests' ? { ...input, acceptanceTests: profile.acceptance_tests }
@@ -145,24 +207,29 @@ async function verifyCandidate({ providers, approval, profile, revision, report,
       : { ...input, baseline: approval.baseline, requirements: profile.requirements, acceptanceTests: profile.acceptance_tests };
     let result;
     let reads = 0;
-    const maxReads = stage === 'ci' ? 3 : 1;
-    do {
-      if (reads > 0) await delay(pollIntervalMs, undefined, { signal: budget.signal });
-      result = await callProvider(providers[stage].run, args, budget);
-      reads += 1;
-    } while (result?.status === 'PENDING' && result.revision === revision && reads < maxReads);
+    const github = approval.githubPullRequest !== undefined && stage !== 'tests';
+    const maxReads = stage === 'ci' ? ciReads : 1;
+    try {
+      do {
+        if (reads > 0) await delay(pollIntervalMs, undefined, { signal: budget.signal });
+        reads += 1;
+        result = await callProvider(providers[stage].run, args, budget);
+      } while (result?.status === 'PENDING' && result.revision === revision && reads < maxReads);
+    } catch (error) {
+      if (!github || !(budget.signal.aborted || error instanceof ProviderDeadline)) throw error;
+      result = { status: 'BLOCKED', revision, reason: 'GitHub evidence read deadline reached' };
+    }
     const findings = result?.status === 'FAIL' ? compactFindings(result.findings, stage, approval.requiredChecks) : [];
     let status = result?.status;
     if (!['PASS', 'FAIL', 'GATE_A'].includes(status) || result.revision !== revision ||
         (status === 'FAIL' && findings.length === 0)) status = 'BLOCKED';
     const check = { cycle, revision, stage, status, reads, findings: findings.map(({ id }) => id) };
-    const github = approval.githubPullRequest !== undefined && stage !== 'tests';
     if (github && result?.evidence) check.evidence = result.evidence;
     if (github && result?.reason) check.reason = result.reason;
     report.checks.push(check);
     if (status === 'BLOCKED') {
       const reason = check.reason ?? (stage === 'ci' && result?.status === 'PENDING' && result.revision === revision
-        ? 'required GitHub checks are still pending after three reads'
+        ? (ciReads === 3 ? 'required GitHub checks are still pending after three reads' : 'required GitHub checks are still pending')
         : `${stage} provider did not supply usable verification for the candidate revision`);
       return { status, reason };
     }
@@ -219,7 +286,7 @@ export async function runIssueLoop({
       await mkdir(directory, { mode: 0o700 });
     } catch (error) {
       if (error.code === 'EEXIST') {
-        return replay(directory, fingerprint, report, realExecution === false && githubProviders
+        return await replay(directory, fingerprint, report, realExecution === false && githubProviders
           ? recheckGitHubEvidence : undefined);
       }
       throw error;
@@ -309,7 +376,7 @@ export async function runIssueLoop({
     try {
       const outcome = await verifyCandidate({
         providers, approval, profile, revision: current.revision, report: current, cycle, budget, pollIntervalMs,
-        stages: ['ci', 'review'],
+        stages: ['ci', 'review'], ciReads: 1,
       });
       current.reviewer = {
         profile: providers.review.principal,

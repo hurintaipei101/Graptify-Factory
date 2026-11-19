@@ -49,7 +49,9 @@ The loop returns a compact `factory.issue_run_report.v1` with `READY`, `BLOCKED`
 
 ## F2-09A GitHub evidence
 
-Add `githubPullRequest` (the same-repository PR number) to the operator-supplied `approval` to select the built-in CI and Codex review providers. Keep the existing simulated coding and test providers. The report's top-level `mode` describes execution. Each GitHub check's `evidence.mode` describes its transport. An injected `githubEvidenceFetch` marks API evidence as `SIMULATION` and sends no credentials. A successful GitHub evidence claim rechecks CI and review when replayed, without dispatching or rewriting the archived report.
+Add `githubPullRequest` (the same-repository PR number) to the operator-supplied `approval` to select the built-in CI and Codex review providers. Keep the existing simulated coding and test providers. The report's top-level `mode` describes execution. Each GitHub check's `evidence.mode` describes its transport. An injected `githubEvidenceFetch` marks API evidence as `SIMULATION` and sends no credentials.
+
+Identical replay can refresh GitHub evidence for a `READY` claim or a `BLOCKED` candidate with passing tests and pending, expired, or temporarily unavailable GitHub evidence. Refresh preserves the candidate and attempt history, persists the updated decision, and runs only the GitHub providers. Each refresh reads CI once and, if CI passes, reads review once. A durable claim excludes concurrent refreshes, and refreshes start at least five seconds apart. A replay during an active refresh or cooldown can return `BLOCKED` while current evidence is unavailable. Reconcile an interrupted refresh claim before retrying.
 
 The live providers use GitHub.com's API and the existing repository-scoped Actions job token. An eligible job needs `checks: read` and `pull-requests: read` and can expose `${{ github.token }}` as `GITHUB_TOKEN` or `GH_TOKEN`. The current Node 22 job declares `contents: read` for checkout. Jobs without the evidence permissions or token return `BLOCKED`.
 

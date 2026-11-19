@@ -55,7 +55,7 @@ function githubFixture(options, mutate = () => {}) {
     assert.equal(request.headers.authorization, undefined);
     assert.equal(request.redirect, 'error');
     assert.ok(request.signal instanceof AbortSignal);
-    const timestamp = new Date().toISOString();
+    const timestamp = new Date(Date.now()).toISOString();
     const revision = candidate(0);
     const author = { login: 'chatgpt-codex-connector', __typename: 'Bot' };
     const connection = (nodes) => ({ nodes, pageInfo: { hasNextPage: false } });
@@ -82,7 +82,7 @@ function githubFixture(options, mutate = () => {}) {
     };
     const checks = { total_count: 1, check_runs: [run] };
     const graph = { data: { repository: { nameWithOwner: repository, pullRequest: pr } } };
-    const status = mutate({ path, restPr, run, checks, graph, pr, review, thread }) ?? 200;
+    const status = (await mutate({ path, restPr, run, checks, graph, pr, review, thread })) ?? 200;
     if (path === '/graphql') {
       assert.equal(request.method, 'POST');
       const { query, variables } = JSON.parse(request.body);
@@ -225,6 +225,155 @@ test('an unavailable Actions login blocks live evidence without relabeling it as
   assert.match(report.next_action, /missing GitHub Actions job token for the approved repository/);
   assert.equal(report.checks.at(-1).evidence.mode, 'LIVE');
   assert.equal(report.checks.at(-1).evidence.source, 'github.com:read-only');
+});
+
+test('identical replay refreshes recoverable GitHub evidence using the original candidate', async (t) => {
+  const cases = [
+    ['pending CI', ({ run }) => { run.status = 'in_progress'; run.conclusion = null; }, 6],
+    ['CI not posted', ({ checks }) => { checks.check_runs = []; checks.total_count = 0; }, 6],
+    ['pending review', ({ review }) => { review.state = 'PENDING'; review.submittedAt = null; }, 3],
+    ['review not posted', ({ pr }) => { pr.reviews.nodes = []; }, 3],
+    ['temporary API outage', ({ path }) => path === '/graphql' ? 503 : 200, 3],
+    ['expired CI', ({ run }) => { run.completed_at = '2020-01-01T00:00:00Z'; }, 2],
+  ];
+  for (const [name, block, initialReads] of cases) {
+    await t.test(name, async (t) => {
+      const options = await fixture(t);
+      let recovered = false;
+      let dispatches = 0;
+      let tests = 0;
+      const calls = githubFixture(options, (response) => recovered ? undefined : block(response));
+      const dispatch = options.providers.coding.run;
+      options.providers.coding.run = (input) => {
+        dispatches += 1;
+        assert.deepEqual(input.memoryScope, options.profile.memory_scope);
+        return dispatch(input);
+      };
+      options.providers.tests.run = (input) => { tests += 1; return pass(input); };
+      const blocked = await runIssueLoop(options);
+      assert.equal(blocked.status, 'BLOCKED');
+      assert.equal(blocked.revision, candidate(0));
+      assert.equal(calls.length, initialReads);
+      const statePath = join(options.stateDirectory, blocked.run_id, 'state.json');
+      const before = JSON.parse(await readFile(statePath, 'utf8'));
+
+      recovered = true;
+      const ready = await runIssueLoop(options);
+      const after = JSON.parse(await readFile(statePath, 'utf8'));
+      assert.equal(ready.status, 'READY');
+      assert.equal(ready.reviewer.verdict, 'PASS');
+      assert.equal(ready.run_id, blocked.run_id);
+      assert.equal(ready.revision, blocked.revision);
+      assert.equal(ready.repair_cycles, blocked.repair_cycles);
+      assert.deepEqual(ready.attempts, blocked.attempts);
+      assert.equal(after.fingerprint, before.fingerprint);
+      assert.deepEqual(after.report, ready);
+      assert.equal(calls.length, initialReads + 3);
+      assert.equal(dispatches, 1);
+      assert.equal(tests, 1);
+    });
+  }
+});
+
+test('recoverable replay blocks if GitHub reports a different head', async (t) => {
+  const options = await fixture(t);
+  let headChanged = false;
+  const calls = githubFixture(options, ({ restPr, review }) => {
+    if (headChanged) restPr.head.sha = candidate(1);
+    else { review.state = 'PENDING'; review.submittedAt = null; }
+  });
+  const original = await runIssueLoop(options);
+  assert.equal(original.status, 'BLOCKED');
+  assert.match(original.next_action, /review is pending/);
+  headChanged = true;
+  const replay = await runIssueLoop(options);
+  assert.equal(replay.status, 'BLOCKED');
+  assert.match(replay.next_action, /candidate head/);
+  assert.equal(replay.revision, original.revision);
+  assert.deepEqual(replay.attempts, original.attempts);
+  assert.deepEqual(await runIssueLoop(options), replay);
+  assert.equal(calls.length, 4);
+});
+
+test('replay preserves preflight, execution, security and SHA mismatch decisions', async (t) => {
+  for (const kind of ['preflight', 'execution', 'security', 'unauthorized', 'SHA mismatch']) {
+    await t.test(kind, async (t) => {
+      const options = await fixture(t);
+      let recovered = false;
+      const calls = githubFixture(options, ({ path, restPr }) => {
+        if (recovered) return;
+        if (kind === 'unauthorized' && path === '/graphql') return 403;
+        if (kind === 'SHA mismatch') restPr.head.sha = candidate(1);
+      });
+      let dispatches = 0;
+      const dispatch = options.providers.coding.run;
+      options.providers.coding.run = (input) => { dispatches += 1; return dispatch(input); };
+      const originalEvidence = options.evidence;
+      if (kind === 'preflight') options.evidence = {};
+      if (kind === 'execution') options.providers.tests.run = () => { throw new Error('test runner failed'); };
+      if (kind === 'security') options.providers.tests.run = ({ revision }) => ({ status: 'GATE_A', revision });
+
+      const original = await runIssueLoop(options);
+      assert.equal(original.status, kind === 'security' ? 'GATE_A' : 'BLOCKED');
+      const reads = calls.length;
+      options.evidence = originalEvidence;
+      options.providers.tests.run = pass;
+      recovered = true;
+      assert.deepEqual(await runIssueLoop(options), original);
+      assert.equal(calls.length, reads);
+      assert.equal(dispatches, kind === 'preflight' ? 0 : 1);
+    });
+  }
+});
+
+test('concurrent evidence replays share a durable refresh limit and never dispatch', async (t) => {
+  const options = await fixture(t);
+  const now = Date.now();
+  const clock = t.mock.method(Date, 'now', () => now);
+  const entered = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  let refreshing = false;
+  let completed = false;
+  const calls = githubFixture(options, async ({ path, run }) => {
+    if (refreshing && path.endsWith('/check-runs')) {
+      entered.resolve();
+      await release.promise;
+    }
+    if (!completed) { run.status = 'in_progress'; run.conclusion = null; }
+  });
+  const initial = await runIssueLoop(options);
+  assert.equal(initial.status, 'BLOCKED');
+  assert.equal(calls.length, 6);
+  options.providers.coding.run = () => assert.fail('refresh dispatched coding');
+  options.providers.tests.run = () => assert.fail('refresh invoked tests');
+
+  refreshing = true;
+  const active = runIssueLoop(options);
+  await entered.promise;
+  try {
+    const duplicate = await runIssueLoop(options);
+    assert.equal(duplicate.status, 'BLOCKED');
+    assert.match(duplicate.next_action, /refresh is active/);
+    assert.equal(calls.length, 8);
+  } finally {
+    release.resolve();
+  }
+  const pending = await active;
+  assert.equal(pending.status, 'BLOCKED');
+  assert.equal(pending.checks.at(-1).reads, 1);
+  completed = true;
+  assert.deepEqual(await runIssueLoop(options), pending);
+  assert.equal(calls.length, 8);
+
+  clock.mock.mockImplementation(() => now + 5_000);
+  const ready = await runIssueLoop(options);
+  assert.equal(ready.status, 'READY');
+  assert.equal(ready.repair_cycles, 0);
+  assert.equal(calls.length, 11);
+  const limited = await runIssueLoop(options);
+  assert.equal(limited.status, 'BLOCKED');
+  assert.match(limited.next_action, /rate limited/);
+  assert.equal(calls.length, 11);
 });
 
 test('runs targeted test, CI and independent review repairs and replays persisted evidence', async (t) => {
