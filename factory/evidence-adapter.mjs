@@ -38,6 +38,40 @@ function ghRead(execCommand, endpoint) {
 
 function defaultGh(args, callback) { execFile('gh', args, { encoding: 'utf8', windowsHide: true }, callback); }
 
+/** Read the latest exact-revision GitHub check runs without AI or write access. */
+export async function inspectGitHubChecks({ repository, revision, requiredChecks, signal, execCommand } = {}) {
+  const result = (status, extras) => ({ revision, status, ...extras });
+  if (typeof repository !== 'string' || !/^[\w.-]+\/[\w.-]+$/.test(repository) ||
+      repository.split('/').some((part) => part === '.' || part === '..') ||
+      typeof revision !== 'string' || !/^[0-9a-f]{40}$/.test(revision) ||
+      !Array.isArray(requiredChecks) || requiredChecks.length === 0 || requiredChecks.length > 24 ||
+      [...requiredChecks].some((name) => typeof name !== 'string' || !name || name.length > 128) || signal?.aborted) {
+    return result('BLOCKED');
+  }
+  const read = execCommand ?? ((args, callback) => execFile('gh', args, {
+    encoding: 'utf8', windowsHide: true, timeout: 10_000, maxBuffer: 262_144, killSignal: 'SIGKILL', signal,
+  }, callback));
+  const response = await ghRead(read, `${GH_ENDPOINTS.checks(repository, revision)}?filter=latest&per_page=100`);
+  const { check_runs: runs, total_count: count } = response.value ?? {};
+  if (!response.ok || !Array.isArray(runs) || count !== runs.length || signal?.aborted) return result('BLOCKED');
+  const findings = [];
+  let pending = false;
+  for (const name of requiredChecks) {
+    const matches = runs.filter((run) => run?.name === name);
+    if (matches.length > 1) return result('BLOCKED');
+    const [check] = matches;
+    if (check && check.head_sha !== revision) return result('BLOCKED');
+    if (!check || ['queued', 'in_progress', 'pending', 'requested', 'waiting'].includes(check.status)) {
+      pending = true;
+      continue;
+    }
+    if (check.status !== 'completed' || !['success', 'failure'].includes(check.conclusion)) return result('BLOCKED');
+    if (check.conclusion === 'failure') findings.push({ id: name, summary: 'Required GitHub check failed' });
+  }
+  if (findings.length > 0) return result('FAIL', { findings });
+  return result(pending ? 'PENDING' : 'PASS');
+}
+
 /** Collect only read-only GitHub evidence. No successful CI result implies protection. */
 export async function collectGitHubEvidence({ repository, branch = 'main', ref = branch, requiredChecks = [], nowMs = Date.now(), execCommand = defaultGh } = {}) {
   const observedAt = new Date(nowMs).toISOString();

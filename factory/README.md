@@ -29,3 +29,20 @@ FACAPP technical pilot achieved frontend/backend/Supabase RLS, GitHub CI, Stagin
 
 ## Execution ownership
 The packet is a planning and bootstrap deliverable. It is not a claim that tasks were created in Linear, code was pushed to GitHub, Hindsight was configured, or Staging/Production was deployed. Record those facts only after the external systems provide evidence.
+
+## F2-08 issue loop
+
+Call `runIssueLoop({ profile, approval, evidence, providers, stateDirectory })` from `factory/issue-loop.mjs`. Use the issue execution profile contract and a trusted operator-supplied approval containing `approved: true`, `profileDigest: issueProfileDigest(profile)`, `repository`, `environment`, the full `baseline` SHA, and nonempty `requiredChecks`. Pass fresh Linear and GitHub baseline evidence through the existing adapter format. The absolute state directory must be writable, trusted, and shared by all workers for the issue on a filesystem that supports atomic directory creation and rename.
+
+Register simulation providers with `mode: 'SIMULATION'`, a distinct coding and reviewer `principal`, and `run(input, { signal })`. Use these roles and result contracts.
+
+| Provider | Kind | Result |
+| --- | --- | --- |
+| `coding` | `agent` | Match the authorized `role_profile` in the provider's `profile` field. Return `PASS` and a new full candidate `revision`. |
+| `tests` | `deterministic` | Run the scoped acceptance tests without an AI call. Return a verdict for the requested `revision`. |
+| `ci` | `read-only` | Inspect the named checks for the requested `revision`. Return `PENDING` while checks are in flight. `inspectGitHubChecks` supports read-only observation through the existing `gh` CLI or a fixture transport. |
+| `review` | `agent` | Review the candidate against the approved baseline and acceptance criteria. Return a verdict for that `revision`. |
+
+Verification providers return `{ status, revision }`. A repairable `FAIL` must include one to eight `findings` with an `id` and a short `summary`. Use `BLOCKED` for unavailable controls and `GATE_A` for scope, security or privilege exceptions. The loop gives coding only the approved criteria and the previous attempt's findings. It checks tests, CI, and review in that order with at most three reads of pending CI per candidate and one initial attempt plus three repairs.
+
+The loop returns a compact `factory.issue_run_report.v1` with `READY`, `BLOCKED`, or `GATE_A`. Identical invocations replay the stored report. Concurrent calls, interrupted claims, and changed inputs for a claimed issue block dispatch. Reconcile an interrupted claim before authorizing any new execution. Keep simulation evidence labeled as such. Live dispatch remains disabled even when requested, pending verified write isolation, CI access, and independent review. This entry point exposes no merge or deployment operations.
