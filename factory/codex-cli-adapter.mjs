@@ -4,6 +4,8 @@ import { TextDecoder } from 'node:util';
 
 const DEFAULT_LIMITS = Object.freeze({ timeoutMs: 120_000, maxEvents: 256, maxEventBytes: 16_384, maxOutputBytes: 32_768 });
 const FORBIDDEN_CAPABILITIES = new Set(['merge', 'deploy', 'production']);
+const TERMINATION_GRACE_MS = 100;
+const CLOSE_CONFIRMATION_MS = 250;
 
 function fail(reason, evidence = {}) { return { status: 'FAIL', passed: false, reason, evidence: compactEvidence(evidence) }; }
 function compactEvidence(evidence) {
@@ -24,8 +26,9 @@ function parseJsonl(text, limits) {
   let lastEventType = null;
   let turnCompleted = false;
   let turnFailed = false;
-  for (const line of text.split(/\r?\n/)) {
-    if (!line.trim()) continue;
+  const lines = text.split(/\r?\n/);
+  if (lines.at(-1) === '') lines.pop();
+  for (const line of lines) {
     if (Buffer.byteLength(line) > limits.maxEventBytes) throw new Error('JSONL event exceeds bounded memory limit');
     let event; try { event = JSON.parse(line); } catch { throw new Error('malformed JSONL event'); }
     if (!event || typeof event !== 'object' || Array.isArray(event)) throw new Error('JSONL event must be an object');
@@ -52,47 +55,75 @@ export function createCodexCliAdapter(options = {}) {
     let workspace;
     try { workspace = await verifiedWorkspace(context.workspace ?? issue.workspace, allowedWorkspaces); } catch (error) { return fail(error.message); }
     if (typeof spawn !== 'function') return fail('injectable process factory is required');
+    if (context.signal?.aborted) return fail('execution cancelled', { cancelled: true });
     const args = ['exec', '--json', '--sandbox', 'read-only', '--skip-git-repo-check', String(context.prompt ?? issue.prompt ?? '')];
     const env = { PATH: process.env.PATH ?? '', CODEX_HOME: context.codexHome ?? path.join(workspace, '.codex-isolated') };
     return new Promise((resolve) => {
-      let settled = false; let timer;
+      let settled = false;
+      let exited = false;
+      let termination;
+      let executionTimer;
+      let escalationTimer;
+      let confirmationTimer;
       let stdout = '';
       let stdoutBytes = 0;
-      let outputLimitExceeded = false;
-      let invalidUtf8 = false;
       const stdoutDecoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
-      const finish = (result) => { if (settled) return; settled = true; clearTimeout(timer); resolve(result); };
       let child;
+      const finish = (result) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(executionTimer);
+        clearTimeout(escalationTimer);
+        clearTimeout(confirmationTimer);
+        context.signal?.removeEventListener('abort', cancel);
+        resolve(result);
+      };
+      const sendSignal = (signal) => {
+        try { child.kill?.(signal); } catch {
+          // Signal delivery can fail. The close event or confirmation deadline determines the result.
+        }
+      };
+      const waitForClose = () => {
+        if (confirmationTimer) return;
+        const { reason, evidence } = termination;
+        confirmationTimer = setTimeout(() => {
+          finish(fail(`${reason}; termination failed: child close was not confirmed`, evidence));
+          child.stdin?.destroy?.();
+          child.stdout?.destroy?.();
+          child.stderr?.destroy?.();
+          child.unref?.();
+        }, CLOSE_CONFIRMATION_MS);
+      };
+      const terminate = (reason, evidence = {}) => {
+        if (settled || termination) return;
+        termination = { reason, evidence };
+        stdout = '';
+        clearTimeout(executionTimer);
+        if (exited) return waitForClose();
+        escalationTimer = setTimeout(() => {
+          waitForClose();
+          sendSignal('SIGKILL');
+        }, TERMINATION_GRACE_MS);
+        sendSignal('SIGTERM');
+      };
+      const cancel = () => terminate('execution cancelled', { cancelled: true });
       try { child = spawn('codex', args, { cwd: workspace, env, windowsHide: true }); } catch (error) { finish(fail(`spawn failed: ${error.message}`)); return; }
-      const cancel = () => { if (!settled) { child.kill?.('SIGTERM'); finish(fail('execution cancelled', { cancelled: true })); } };
-      if (context.signal) { if (context.signal.aborted) return cancel(); context.signal.addEventListener('abort', cancel, { once: true }); }
-      child.stdout?.on('data', (chunk) => {
-        if (settled || outputLimitExceeded || invalidUtf8) return;
-        const isText = typeof chunk === 'string';
-        stdoutBytes += isText ? Buffer.byteLength(chunk) : chunk.byteLength;
-        if (stdoutBytes > maxOutputBytes) {
-          outputLimitExceeded = true;
-          child.kill?.('SIGTERM');
-          return;
-        }
-        try {
-          stdout += stdoutDecoder.decode(isText ? Buffer.from(chunk) : chunk, { stream: true });
-        } catch {
-          invalidUtf8 = true;
-          child.kill?.('SIGTERM');
-        }
+      executionTimer = setTimeout(() => terminate('execution timed out', { timedOut: true }), timeoutMs);
+      child.on('error', (error) => terminate(`process error: ${error.message}`));
+      child.on('exit', () => {
+        if (settled) return;
+        exited = true;
+        clearTimeout(escalationTimer);
+        if (termination) waitForClose();
       });
-      // Drain stderr without retaining it because compact evidence excludes it.
-      child.stderr?.on('data', () => {});
-      timer = setTimeout(() => { child.kill?.('SIGTERM'); finish(fail('execution timed out', { timedOut: true })); }, timeoutMs);
-      child.on('error', (error) => finish(fail(`process error: ${error.message}`)));
       child.on('close', (exitCode, signal) => {
         if (settled) return;
-        if (outputLimitExceeded) return finish(fail('JSONL output exceeds bounded memory limit', { exitCode, signal }));
-        if (!invalidUtf8) {
-          try { stdout += stdoutDecoder.decode(); } catch { invalidUtf8 = true; }
+        if (termination) return finish(fail(termination.reason, { ...termination.evidence, exitCode, signal }));
+        try {
+          stdout += stdoutDecoder.decode();
+        } catch {
+          return finish(fail('invalid UTF-8 in Codex CLI stdout', { exitCode, signal }));
         }
-        if (invalidUtf8) return finish(fail('invalid UTF-8 in Codex CLI stdout', { exitCode, signal }));
         let parsed; try { parsed = parseJsonl(stdout, limits); } catch (error) { finish(fail(error.message, { exitCode, signal })); return; }
         const evidence = { ...parsed, exitCode, signal };
         if (exitCode !== 0) return finish(fail(`Codex CLI exited with code ${exitCode}`, evidence));
@@ -100,6 +131,21 @@ export function createCodexCliAdapter(options = {}) {
         if (!parsed.turnCompleted) return finish(fail('Codex CLI did not report turn.completed', evidence));
         finish({ status: 'PASS', passed: true, evidence: compactEvidence(evidence) });
       });
+      child.stdout?.on('data', (chunk) => {
+        if (settled || termination) return;
+        if (!(chunk instanceof Uint8Array)) return terminate('Codex CLI stdout must supply raw bytes');
+        stdoutBytes += chunk.byteLength;
+        if (stdoutBytes > maxOutputBytes) return terminate('JSONL output exceeds bounded memory limit');
+        try {
+          stdout += stdoutDecoder.decode(chunk, { stream: true });
+        } catch {
+          terminate('invalid UTF-8 in Codex CLI stdout');
+        }
+      });
+      // Drain stderr without retaining it because compact evidence excludes it.
+      child.stderr?.on('data', () => {});
+      if (context.signal?.aborted) cancel();
+      else if (!settled) context.signal?.addEventListener('abort', cancel, { once: true });
     });
   };
 }

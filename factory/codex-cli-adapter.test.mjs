@@ -1,14 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { spawn as spawnNode } from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import { mkdtemp, mkdir, symlink } from 'node:fs/promises';
+import { mkdtemp, symlink } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { createCodexCliAdapter } from './codex-cli-adapter.mjs';
 
 const issue = (extra = {}) => ({ issueKey: 'F2-06C', environment: 'staging', ...extra });
 const completed = '{"type":"turn.completed","usage":{"input_tokens":2,"cached_input_tokens":0,"output_tokens":1}}\n';
-function child({ output = completed, chunks = [output], code = 0, delay = 0, kill = () => {} } = {}) {
+function child({ output = completed, chunks = [Buffer.from(output)], code = 0, delay = 0, kill = () => {} } = {}) {
   const stdout = new EventEmitter();
   return {
     stdout,
@@ -24,6 +25,28 @@ function child({ output = completed, chunks = [output], code = 0, delay = 0, kil
 }
 async function setup() { return mkdtemp(path.join(os.tmpdir(), 'codex-adapter-')); }
 function ready(root, overrides = {}) { return createCodexCliAdapter({ realExecution: true, allowedWorkspaces: [root], runtimeIsolation: { verified: true }, mcpAccess: { verified: true, allowed: true }, spawn: () => child(), ...overrides }); }
+
+function launchNode(t, source, signals, onReady) {
+  const subprocess = spawnNode(process.execPath, ['-e', source], { stdio: ['ignore', 'pipe', 'pipe'] });
+  const kill = subprocess.kill.bind(subprocess);
+  const watchdog = setTimeout(() => kill('SIGKILL'), 4000);
+  let close = null;
+  const closed = new Promise((resolve) => subprocess.once('close', (code, signal) => {
+    close = { code, signal };
+    clearTimeout(watchdog);
+    resolve();
+  }));
+  if (onReady) subprocess.stderr.once('data', onReady);
+  subprocess.kill = (signal) => {
+    signals.push(signal);
+    return kill(signal);
+  };
+  t.after(async () => {
+    if (!close) kill('SIGKILL');
+    await closed;
+  }, { timeout: 4500 });
+  return { subprocess, get close() { return close; } };
+}
 
 test('fake CLI successful invocation returns compact PASS evidence', async () => { const root = await setup(); const result = await ready(root)(issue(), { workspace: root, prompt: 'test' }); assert.equal(result.status, 'PASS'); assert.equal(result.passed, true); assert.equal(result.evidence.eventCount, 1); assert.equal(result.evidence.lastEventType, 'turn.completed'); });
 
@@ -117,6 +140,135 @@ test('truncated JSONL after completion is FAIL', async () => {
 
   assert.equal(result.status, 'FAIL');
   assert.match(result.reason, /malformed JSONL/);
+});
+
+for (const [description, suffix] of [
+  ['empty record', '\n'],
+  ['whitespace-only record', ' \t\r\n'],
+  ['whitespace-only suffix', ' \t'],
+  ['BOM-only record', '\ufeff\n'],
+  ['BOM-only suffix', '\ufeff'],
+]) {
+  test(`JSONL rejects a trailing ${description} after completion`, async () => {
+    const root = await setup();
+    const chunks = [Buffer.from(completed), Buffer.from(suffix)];
+    const result = await ready(root, { spawn: () => child({ chunks }) })(issue(), { workspace: root });
+    assert.equal(result.status, 'FAIL');
+    assert.match(result.reason, /malformed JSONL/);
+  });
+}
+
+test('JSONL accepts a single LF or CRLF delimiter and a complete final record without one', async () => {
+  const root = await setup();
+  const record = completed.trimEnd();
+  for (const suffix of ['\n', '\r\n', '']) {
+    const result = await ready(root, { spawn: () => child({ output: record + suffix }) })(issue(), { workspace: root });
+    assert.equal(result.status, 'PASS');
+  }
+});
+
+test('pre-decoded stdout fails because byte integrity cannot be verified', async () => {
+  const root = await setup();
+  const result = await ready(root, { spawn: () => child({ chunks: [completed] }) })(issue(), { workspace: root });
+  assert.equal(result.status, 'FAIL');
+  assert.match(result.reason, /raw bytes/);
+});
+
+for (const [trigger, reason] of [
+  ['overflow', /output exceeds/],
+  ['timeout', /timed out/],
+  ['cancellation', /cancelled/],
+]) {
+  test(`${trigger} escalates to SIGKILL and waits for a SIGTERM-resistant Node child to close`, { timeout: 5500 }, async (t) => {
+    const root = await setup();
+    const controller = new AbortController();
+    const signals = [];
+    const output = trigger === 'overflow' ? completed + ' '.repeat(256) : completed;
+    const script = `
+      process.on('SIGTERM', () => {});
+      setTimeout(() => process.exit(99), 3500);
+      process.stdout.write(${JSON.stringify(output)});
+      process.stderr.write('ready\\n');
+    `;
+    let launched;
+    const result = await ready(root, {
+      maxOutputBytes: 128,
+      timeoutMs: 800,
+      spawn: () => {
+        const onReady = trigger === 'cancellation' ? () => controller.abort() : undefined;
+        launched = launchNode(t, script, signals, onReady);
+        return launched.subprocess;
+      },
+    })(issue(), { workspace: root, signal: controller.signal });
+
+    assert.equal(result.status, 'FAIL');
+    assert.match(result.reason, reason);
+    assert.deepEqual(launched.close, { code: null, signal: 'SIGKILL' });
+    assert.equal(result.evidence.signal, 'SIGKILL');
+    assert.equal(result.evidence.timedOut, trigger === 'timeout');
+    assert.equal(result.evidence.cancelled, trigger === 'cancellation');
+    assert.deepEqual(signals, ['SIGTERM', 'SIGKILL']);
+  });
+}
+
+test('normal Node child exit closes without a kill signal', { timeout: 5500 }, async (t) => {
+  const root = await setup();
+  const signals = [];
+  let launched;
+  const result = await ready(root, {
+    timeoutMs: 800,
+    spawn: () => {
+      launched = launchNode(t, `process.stdout.write(${JSON.stringify(completed)});`, signals);
+      return launched.subprocess;
+    },
+  })(issue(), { workspace: root });
+
+  assert.equal(result.status, 'PASS');
+  assert.deepEqual(launched.close, { code: 0, signal: null });
+  assert.deepEqual(signals, []);
+});
+
+test('repeated stop triggers preserve the first failure and report unconfirmed closure', { timeout: 2000 }, async () => {
+  const root = await setup();
+  const controller = new AbortController();
+  const signals = [];
+  const subprocess = new EventEmitter();
+  subprocess.stdout = new EventEmitter();
+  subprocess.kill = (signal) => {
+    signals.push(signal);
+    controller.abort();
+    subprocess.stdout.emit('data', Buffer.alloc(129));
+    return false;
+  };
+  const result = await ready(root, {
+    timeoutMs: 15,
+    maxOutputBytes: 128,
+    spawn: () => {
+      setImmediate(() => subprocess.stdout.emit('data', Buffer.alloc(129)));
+      return subprocess;
+    },
+  })(issue(), { workspace: root, signal: controller.signal });
+
+  assert.equal(result.status, 'FAIL');
+  assert.match(result.reason, /output exceeds/);
+  assert.match(result.reason, /termination failed.*close/);
+  assert.deepEqual(signals, ['SIGTERM', 'SIGKILL']);
+});
+
+test('observed exit cancels escalation while missing close still fails explicitly', { timeout: 2000 }, async () => {
+  const root = await setup();
+  const signals = [];
+  const subprocess = new EventEmitter();
+  subprocess.kill = (signal) => {
+    signals.push(signal);
+    subprocess.emit('exit', 0, null);
+  };
+  const result = await ready(root, { timeoutMs: 5, spawn: () => subprocess })(issue(), { workspace: root });
+
+  assert.equal(result.status, 'FAIL');
+  assert.equal(result.evidence.timedOut, true);
+  assert.match(result.reason, /termination failed.*close/);
+  assert.deepEqual(signals, ['SIGTERM']);
 });
 
 test('nonzero CLI exit is FAIL', async () => { const root = await setup(); const result = await ready(root, { spawn: () => child({ code: 2 }) })(issue(), { workspace: root }); assert.equal(result.status, 'FAIL'); assert.equal(result.evidence.exitCode, 2); });
