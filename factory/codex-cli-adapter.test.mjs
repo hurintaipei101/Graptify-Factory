@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn as spawnNode } from 'node:child_process';
-import { EventEmitter } from 'node:events';
+import { EventEmitter, getEventListeners } from 'node:events';
 import { mkdtemp, symlink } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -257,18 +257,137 @@ test('repeated stop triggers preserve the first failure and report unconfirmed c
 
 test('observed exit cancels escalation while missing close still fails explicitly', { timeout: 2000 }, async () => {
   const root = await setup();
+  const { signal } = new AbortController();
   const signals = [];
   const subprocess = new EventEmitter();
   subprocess.kill = (signal) => {
     signals.push(signal);
     subprocess.emit('exit', 0, null);
   };
-  const result = await ready(root, { timeoutMs: 5, spawn: () => subprocess })(issue(), { workspace: root });
+  const result = await ready(root, { timeoutMs: 5, spawn: () => subprocess })(issue(), { workspace: root, signal });
 
   assert.equal(result.status, 'FAIL');
   assert.equal(result.evidence.timedOut, true);
   assert.match(result.reason, /termination failed.*close/);
   assert.deepEqual(signals, ['SIGTERM']);
+  assert.deepEqual(getEventListeners(signal, 'abort'), []);
+});
+
+test('shared abort cancels a real Node child after completion even when an earlier listener stops propagation', { timeout: 5500 }, async (t) => {
+  const root = await setup();
+  const controller = new AbortController();
+  const { signal } = controller;
+  const stopPropagation = (event) => event.stopImmediatePropagation();
+  signal.addEventListener('abort', stopPropagation);
+  const signals = [];
+  const script = `
+    process.on('SIGTERM', () => process.exit(0));
+    process.stdout.write(${JSON.stringify(completed)});
+    setTimeout(() => process.exit(0), 700);
+  `;
+  let launched;
+  const result = await ready(root, {
+    timeoutMs: 2500,
+    spawn: () => {
+      launched = launchNode(t, script, signals);
+      queueMicrotask(() => launched.subprocess.stdout.once('data', () => controller.abort()));
+      return launched.subprocess;
+    },
+  })(issue(), { workspace: root, signal });
+
+  assert.equal(result.status, 'FAIL');
+  assert.equal(result.evidence.cancelled, true);
+  assert.equal(result.evidence.exitCode, 0);
+  assert.deepEqual(launched.close, { code: 0, signal: null });
+  assert.deepEqual(signals, ['SIGTERM']);
+  assert.deepEqual(getEventListeners(signal, 'abort'), [stopPropagation]);
+});
+
+test('already-aborted execution fails without spawning or adding a listener', async () => {
+  const root = await setup();
+  const signal = AbortSignal.abort();
+  const spawn = () => assert.fail('an already-aborted execution must not spawn');
+  const result = await ready(root, { spawn })(issue(), { workspace: root, signal });
+
+  assert.equal(result.status, 'FAIL');
+  assert.equal(result.evidence.cancelled, true);
+  assert.deepEqual(getEventListeners(signal, 'abort'), []);
+});
+
+test('spawn failure disposes the abort subscription', async () => {
+  const root = await setup();
+  const { signal } = new AbortController();
+  const spawn = () => { throw new Error('test spawn failure'); };
+  const result = await ready(root, { spawn })(issue(), { workspace: root, signal });
+
+  assert.equal(result.status, 'FAIL');
+  assert.match(result.reason, /spawn failed/);
+  assert.deepEqual(getEventListeners(signal, 'abort'), []);
+});
+
+for (const [closeMs, decisionMs] of [[9, 9], [10, 10], [11, 11], [9, 10]]) {
+  test(`close at ${closeMs} ms and final check at ${decisionMs} ms enforce the 10 ms deadline`, async (t) => {
+    const root = await setup();
+    const { signal } = new AbortController();
+    let elapsed = 0n;
+    let closing = false;
+    t.mock.method(process.hrtime, 'bigint', () => {
+      const now = elapsed;
+      if (closing) elapsed = BigInt(decisionMs) * 1_000_000n;
+      return now;
+    });
+    const timers = new Set();
+    const wakeUp = t.mock.method(globalThis, 'setTimeout', (callback) => {
+      timers.add(callback);
+      return callback;
+    });
+    t.mock.method(globalThis, 'clearTimeout', (callback) => timers.delete(callback));
+    const subprocess = new EventEmitter();
+    subprocess.stdout = new EventEmitter();
+    subprocess.kill = () => assert.fail('close already confirms termination');
+    const result = await ready(root, {
+      timeoutMs: 10,
+      spawn: () => {
+        queueMicrotask(() => {
+          subprocess.stdout.emit('data', Buffer.from(completed));
+          elapsed = BigInt(closeMs) * 1_000_000n;
+          closing = true;
+          subprocess.emit('close', 0, null);
+        });
+        return subprocess;
+      },
+    })(issue(), { workspace: root, signal });
+
+    const expired = decisionMs >= 10;
+    assert.equal(result.status, expired ? 'FAIL' : 'PASS');
+    assert.equal(result.evidence.timedOut, expired);
+    assert.equal(result.evidence.exitCode, 0);
+    assert.equal(wakeUp.mock.callCount(), 1);
+    assert.equal(timers.size, 0);
+    assert.deepEqual(getEventListeners(signal, 'abort'), []);
+  });
+}
+
+test('an event-loop stall past the deadline prevents PASS even when close runs before timers', async () => {
+  const root = await setup();
+  const subprocess = new EventEmitter();
+  subprocess.stdout = new EventEmitter();
+  subprocess.kill = () => assert.fail('the child has already closed');
+  const result = await ready(root, {
+    timeoutMs: 20,
+    spawn: () => {
+      queueMicrotask(() => {
+        subprocess.stdout.emit('data', Buffer.from(completed));
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 40);
+        subprocess.emit('close', 0, null);
+      });
+      return subprocess;
+    },
+  })(issue(), { workspace: root });
+
+  assert.equal(result.status, 'FAIL');
+  assert.equal(result.evidence.timedOut, true);
+  assert.equal(result.evidence.exitCode, 0);
 });
 
 test('nonzero CLI exit is FAIL', async () => { const root = await setup(); const result = await ready(root, { spawn: () => child({ code: 2 }) })(issue(), { workspace: root }); assert.equal(result.status, 'FAIL'); assert.equal(result.evidence.exitCode, 2); });

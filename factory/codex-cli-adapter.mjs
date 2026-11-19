@@ -1,3 +1,4 @@
+import { addAbortListener } from 'node:events';
 import { realpath, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { TextDecoder } from 'node:util';
@@ -55,9 +56,13 @@ export function createCodexCliAdapter(options = {}) {
     let workspace;
     try { workspace = await verifiedWorkspace(context.workspace ?? issue.workspace, allowedWorkspaces); } catch (error) { return fail(error.message); }
     if (typeof spawn !== 'function') return fail('injectable process factory is required');
-    if (context.signal?.aborted) return fail('execution cancelled', { cancelled: true });
+    const abortSignal = context.signal;
+    if (abortSignal?.aborted) return fail('execution cancelled', { cancelled: true });
     const args = ['exec', '--json', '--sandbox', 'read-only', '--skip-git-repo-check', String(context.prompt ?? issue.prompt ?? '')];
     const env = { PATH: process.env.PATH ?? '', CODEX_HOME: context.codexHome ?? path.join(workspace, '.codex-isolated') };
+    // Match Node's setTimeout delay normalization for the execution budget.
+    const requestedDelay = Number(timeoutMs);
+    const executionDelay = requestedDelay >= 1 && requestedDelay <= 2_147_483_647 ? Math.trunc(requestedDelay) : 1;
     return new Promise((resolve) => {
       let settled = false;
       let exited = false;
@@ -65,6 +70,7 @@ export function createCodexCliAdapter(options = {}) {
       let executionTimer;
       let escalationTimer;
       let confirmationTimer;
+      let abortSubscription;
       let stdout = '';
       let stdoutBytes = 0;
       const stdoutDecoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
@@ -75,7 +81,7 @@ export function createCodexCliAdapter(options = {}) {
         clearTimeout(executionTimer);
         clearTimeout(escalationTimer);
         clearTimeout(confirmationTimer);
-        context.signal?.removeEventListener('abort', cancel);
+        abortSubscription?.[Symbol.dispose]();
         resolve(result);
       };
       const sendSignal = (signal) => {
@@ -106,9 +112,24 @@ export function createCodexCliAdapter(options = {}) {
         }, TERMINATION_GRACE_MS);
         sendSignal('SIGTERM');
       };
-      const cancel = () => terminate('execution cancelled', { cancelled: true });
+      const cancel = () => {
+        if (child) terminate('execution cancelled', { cancelled: true });
+      };
+      const checkDeadline = () => {
+        if (settled || termination) return;
+        const remainingMs = Number(deadline - process.hrtime.bigint()) / 1_000_000;
+        if (remainingMs <= 0) return terminate('execution timed out', { timedOut: true });
+        executionTimer = setTimeout(checkDeadline, Math.ceil(remainingMs));
+      };
+      const closeFailure = (evidence) => {
+        if (abortSignal?.aborted) return fail('execution cancelled', { ...evidence, cancelled: true });
+        if (process.hrtime.bigint() >= deadline) return fail('execution timed out', { ...evidence, timedOut: true });
+        return null;
+      };
+      if (abortSignal) abortSubscription = addAbortListener(abortSignal, cancel);
+      const deadline = process.hrtime.bigint() + BigInt(executionDelay) * 1_000_000n;
+      if (abortSignal?.aborted) return finish(fail('execution cancelled', { cancelled: true }));
       try { child = spawn('codex', args, { cwd: workspace, env, windowsHide: true }); } catch (error) { finish(fail(`spawn failed: ${error.message}`)); return; }
-      executionTimer = setTimeout(() => terminate('execution timed out', { timedOut: true }), timeoutMs);
       child.on('error', (error) => terminate(`process error: ${error.message}`));
       child.on('exit', () => {
         if (settled) return;
@@ -118,7 +139,10 @@ export function createCodexCliAdapter(options = {}) {
       });
       child.on('close', (exitCode, signal) => {
         if (settled) return;
+        exited = true;
         if (termination) return finish(fail(termination.reason, { ...termination.evidence, exitCode, signal }));
+        const failure = closeFailure({ exitCode, signal });
+        if (failure) return finish(failure);
         try {
           stdout += stdoutDecoder.decode();
         } catch {
@@ -129,7 +153,7 @@ export function createCodexCliAdapter(options = {}) {
         if (exitCode !== 0) return finish(fail(`Codex CLI exited with code ${exitCode}`, evidence));
         if (parsed.turnFailed) return finish(fail('Codex CLI reported turn.failed', evidence));
         if (!parsed.turnCompleted) return finish(fail('Codex CLI did not report turn.completed', evidence));
-        finish({ status: 'PASS', passed: true, evidence: compactEvidence(evidence) });
+        finish(closeFailure(evidence) ?? { status: 'PASS', passed: true, evidence: compactEvidence(evidence) });
       });
       child.stdout?.on('data', (chunk) => {
         if (settled || termination) return;
@@ -144,8 +168,8 @@ export function createCodexCliAdapter(options = {}) {
       });
       // Drain stderr without retaining it because compact evidence excludes it.
       child.stderr?.on('data', () => {});
-      if (context.signal?.aborted) cancel();
-      else if (!settled) context.signal?.addEventListener('abort', cancel, { once: true });
+      if (abortSignal?.aborted) cancel();
+      checkDeadline();
     });
   };
 }
