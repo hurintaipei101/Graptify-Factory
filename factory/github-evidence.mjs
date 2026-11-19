@@ -135,13 +135,21 @@ function createGitHubEvidenceClient(fetchImpl) {
         const reason = [401, 403, 404].includes(response.status)
           ? `GitHub API HTTP ${response.status}; verify job token access (${permission})`
           : `GitHub API request failed (HTTP ${Number.isInteger(response.status) ? response.status : 'unknown'})`;
-        return { ok: false, reason };
+        let permissionDenied = false;
+        if (response.status === 403) {
+          const error = await response.json().catch(() => null);
+          permissionDenied = error?.message === 'Resource not accessible by integration';
+        }
+        return { ok: false, reason, permissionDenied };
       }
       const value = await response.json();
       if (query && value?.errors !== undefined) {
         const denied = Array.isArray(value.errors) && value.errors.some((error) =>
           ['FORBIDDEN', 'UNAUTHORIZED', 'INSUFFICIENT_SCOPES'].includes(error?.type));
-        return { ok: false, reason: denied ? 'GitHub GraphQL denied pull-request read access' : 'GitHub GraphQL returned errors' };
+        return {
+          ok: false, permissionDenied: denied,
+          reason: denied ? 'GitHub GraphQL denied pull-request read access' : 'GitHub GraphQL returned errors',
+        };
       }
       return { ok: true, value };
     } catch {
@@ -210,7 +218,9 @@ export async function observeMergedGitHubEvidence({
 } = {}) {
   const { mode, source, read } = createGitHubEvidenceClient(fetchImpl);
   const report = { mode, source, authorization: 'BLOCKED' };
-  const fail = (reason) => ({ ...report, evidence_read: 'BLOCKED', reason });
+  const fail = (reason, permissionDenied) => ({
+    ...report, evidence_read: 'BLOCKED', reason, ...(permissionDenied ? { permission_denied: true } : {}),
+  });
   if (!validRepository(repository) || !validPullRequest(pullRequest) || !sha(revision) ||
       !sha(mergeCommit) || revision === mergeCommit || typeof requiredCheck !== 'string' ||
       !/^[\w .-]{1,128}$/.test(requiredCheck)) {
@@ -221,7 +231,7 @@ export async function observeMergedGitHubEvidence({
     /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,3})?Z$/.test(value) && Date.parse(value) <= now.getTime();
   const options = { repository };
   const prResponse = await read(`repos/${repository}/pulls/${pullRequest}`, options);
-  if (!prResponse.ok) return fail(prResponse.reason);
+  if (!prResponse.ok) return fail(prResponse.reason, prResponse.permissionDenied);
   const pr = prResponse.value;
   if (!sameRepo(pr?.base?.repo?.full_name, repository) || !sameRepo(pr?.head?.repo?.full_name, repository) ||
       pr.number !== pullRequest || pr.state !== 'closed' || pr.merged !== true || pr.base.ref !== 'main' ||
@@ -237,7 +247,7 @@ export async function observeMergedGitHubEvidence({
     read(`repos/${repository}/commits/${revision}/check-runs?filter=latest&per_page=100`, options),
     read('graphql', { ...options, query: REVIEW_QUERY, variables: { owner, name, number: pullRequest } }),
   ]);
-  if (!checks.ok) return fail(checks.reason);
+  if (!checks.ok) return fail(checks.reason, checks.permissionDenied);
   const { check_runs: runs, total_count: count } = checks.value ?? {};
   if (!Array.isArray(runs) || runs.length !== count || count > 100) {
     return fail('GitHub check-run response is invalid or incomplete');
@@ -254,7 +264,7 @@ export async function observeMergedGitHubEvidence({
     conclusion: check.conclusion, completed_at: check.completed_at,
   };
 
-  if (!graph.ok) return fail(graph.reason);
+  if (!graph.ok) return fail(graph.reason, graph.permissionDenied);
   const repo = graph.value?.data?.repository;
   const reviewed = repo?.pullRequest;
   if (!sameRepo(repo?.nameWithOwner, repository) || !sameRepo(reviewed?.headRepository?.nameWithOwner, repository) ||
