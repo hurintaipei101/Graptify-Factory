@@ -14,6 +14,7 @@ const ENVIRONMENTS = new Set(['isolated-worker', 'test', 'staging']);
 const STAGES = ['coding', 'tests', 'ci', 'review'];
 const KINDS = { coding: 'agent', tests: 'deterministic', ci: 'read-only', review: 'agent' };
 const GITHUB_REFRESH_INTERVAL_MS = 5_000;
+const ACTIVE_CLAIM = 'run is active or interrupted; reconcile persisted state before taking further action';
 // Match the reasons already persisted in issue reports, including reports from before refresh was supported.
 const RECOVERABLE_GITHUB_BLOCKS = new Set([
   'required GitHub checks are still pending after three reads',
@@ -136,7 +137,7 @@ async function replay(directory, fingerprint, report, recheck) {
   }
   if (stored.fingerprint !== fingerprint) return finish(report, 'BLOCKED', 'issue already claimed with different approved inputs');
   if (stored.report.status === 'RUNNING') {
-    return finish(stored.report, 'BLOCKED', 'run is active or interrupted; reconcile persisted state before taking further action');
+    return finish(stored.report, 'BLOCKED', ACTIVE_CLAIM);
   }
   if (!recheck || !canRefreshGitHubEvidence(stored.report)) return stored.report;
 
@@ -151,6 +152,7 @@ async function replay(directory, fingerprint, report, recheck) {
     // A worker may have refreshed between our first read and acquiring the claim.
     stored = await readStoredRun(directory);
     if (stored.fingerprint !== fingerprint) return finish(report, 'BLOCKED', 'issue already claimed with different approved inputs');
+    if (stored.report.status === 'RUNNING') return finish(stored.report, 'BLOCKED', ACTIVE_CLAIM);
     if (!canRefreshGitHubEvidence(stored.report)) return stored.report;
     const now = Date.now();
     if (now - stored.githubRefreshStartedAt < GITHUB_REFRESH_INTERVAL_MS) {
