@@ -1,5 +1,6 @@
 import { realpath, stat } from 'node:fs/promises';
 import path from 'node:path';
+import { TextDecoder } from 'node:util';
 
 const DEFAULT_LIMITS = Object.freeze({ timeoutMs: 120_000, maxEvents: 256, maxEventBytes: 16_384, maxOutputBytes: 32_768 });
 const FORBIDDEN_CAPABILITIES = new Set(['merge', 'deploy', 'production']);
@@ -19,15 +20,12 @@ async function verifiedWorkspace(workspace, allowedWorkspaces) {
   return resolved;
 }
 function parseJsonl(text, limits) {
-  let bytes = 0;
   let eventCount = 0;
   let lastEventType = null;
   let turnCompleted = false;
   let turnFailed = false;
   for (const line of text.split(/\r?\n/)) {
     if (!line.trim()) continue;
-    bytes += Buffer.byteLength(line);
-    if (bytes > limits.maxOutputBytes) throw new Error('JSONL output exceeds bounded memory limit');
     if (Buffer.byteLength(line) > limits.maxEventBytes) throw new Error('JSONL event exceeds bounded memory limit');
     let event; try { event = JSON.parse(line); } catch { throw new Error('malformed JSONL event'); }
     if (!event || typeof event !== 'object' || Array.isArray(event)) throw new Error('JSONL event must be an object');
@@ -42,7 +40,7 @@ function parseJsonl(text, limits) {
 /** Create a bounded, injectable adapter. Real execution is opt-in and isolation is fail-closed. */
 export function createCodexCliAdapter(options = {}) {
   const { spawn = null, allowedWorkspaces = [], realExecution = false, runtimeIsolation = {}, mcpAccess = {}, timeoutMs = DEFAULT_LIMITS.timeoutMs, maxEvents = DEFAULT_LIMITS.maxEvents, maxEventBytes = DEFAULT_LIMITS.maxEventBytes, maxOutputBytes = DEFAULT_LIMITS.maxOutputBytes } = options;
-  const limits = { timeoutMs, maxEvents, maxEventBytes, maxOutputBytes };
+  const limits = { maxEvents, maxEventBytes };
   return async function runCodex(issue = {}, context = {}) {
     if (issue?.status === 'BLOCKED' || issue?.status === 'STOP' || context?.status === 'BLOCKED' || context?.status === 'STOP') return fail('execution status does not permit subprocess');
     if (!realExecution) return fail('real Codex execution is disabled by default');
@@ -57,20 +55,46 @@ export function createCodexCliAdapter(options = {}) {
     const args = ['exec', '--json', '--sandbox', 'read-only', '--skip-git-repo-check', String(context.prompt ?? issue.prompt ?? '')];
     const env = { PATH: process.env.PATH ?? '', CODEX_HOME: context.codexHome ?? path.join(workspace, '.codex-isolated') };
     return new Promise((resolve) => {
-      let settled = false; let stdout = ''; let stderr = ''; let timer;
+      let settled = false; let timer;
+      let stdout = '';
+      let stdoutBytes = 0;
+      let outputLimitExceeded = false;
+      let invalidUtf8 = false;
+      const stdoutDecoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
       const finish = (result) => { if (settled) return; settled = true; clearTimeout(timer); resolve(result); };
       let child;
       try { child = spawn('codex', args, { cwd: workspace, env, windowsHide: true }); } catch (error) { finish(fail(`spawn failed: ${error.message}`)); return; }
       const cancel = () => { if (!settled) { child.kill?.('SIGTERM'); finish(fail('execution cancelled', { cancelled: true })); } };
       if (context.signal) { if (context.signal.aborted) return cancel(); context.signal.addEventListener('abort', cancel, { once: true }); }
-      child.stdout?.on('data', (chunk) => { stdout += String(chunk); if (Buffer.byteLength(stdout) > maxOutputBytes) child.kill?.('SIGTERM'); });
-      child.stderr?.on('data', (chunk) => { stderr += String(chunk).slice(0, maxOutputBytes); });
+      child.stdout?.on('data', (chunk) => {
+        if (settled || outputLimitExceeded || invalidUtf8) return;
+        const isText = typeof chunk === 'string';
+        stdoutBytes += isText ? Buffer.byteLength(chunk) : chunk.byteLength;
+        if (stdoutBytes > maxOutputBytes) {
+          outputLimitExceeded = true;
+          child.kill?.('SIGTERM');
+          return;
+        }
+        try {
+          stdout += stdoutDecoder.decode(isText ? Buffer.from(chunk) : chunk, { stream: true });
+        } catch {
+          invalidUtf8 = true;
+          child.kill?.('SIGTERM');
+        }
+      });
+      // Drain stderr without retaining it because compact evidence excludes it.
+      child.stderr?.on('data', () => {});
       timer = setTimeout(() => { child.kill?.('SIGTERM'); finish(fail('execution timed out', { timedOut: true })); }, timeoutMs);
       child.on('error', (error) => finish(fail(`process error: ${error.message}`)));
       child.on('close', (exitCode, signal) => {
         if (settled) return;
+        if (outputLimitExceeded) return finish(fail('JSONL output exceeds bounded memory limit', { exitCode, signal }));
+        if (!invalidUtf8) {
+          try { stdout += stdoutDecoder.decode(); } catch { invalidUtf8 = true; }
+        }
+        if (invalidUtf8) return finish(fail('invalid UTF-8 in Codex CLI stdout', { exitCode, signal }));
         let parsed; try { parsed = parseJsonl(stdout, limits); } catch (error) { finish(fail(error.message, { exitCode, signal })); return; }
-        const evidence = { ...parsed, exitCode, signal, stderr: stderr.slice(0, 512) };
+        const evidence = { ...parsed, exitCode, signal };
         if (exitCode !== 0) return finish(fail(`Codex CLI exited with code ${exitCode}`, evidence));
         if (parsed.turnFailed) return finish(fail('Codex CLI reported turn.failed', evidence));
         if (!parsed.turnCompleted) return finish(fail('Codex CLI did not report turn.completed', evidence));
