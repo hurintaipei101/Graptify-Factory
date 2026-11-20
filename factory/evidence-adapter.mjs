@@ -40,8 +40,11 @@ function ghRead(execCommand, endpoint) {
 function defaultGh(args, callback) { execFile('gh', args, { encoding: 'utf8', windowsHide: true }, callback); }
 
 /** Read the latest exact-revision GitHub check runs without AI or write access. */
-export async function inspectGitHubChecks({ repository, revision, requiredChecks, signal, execCommand, read } = {}) {
-  const result = (status, extras) => ({ revision, status, ...extras });
+export async function inspectGitHubChecks({
+  issueKey, linearIssueId, repository, approvalDigest, memoryScope, revision, requiredChecks, signal, execCommand, read,
+} = {}) {
+  const binding = issueKey === undefined ? {} : { issueKey, linearIssueId, repository, approvalDigest, memoryScope };
+  const result = (status, extras) => ({ ...binding, revision, status, ...extras });
   if (typeof repository !== 'string' || !/^[\w.-]+\/[\w.-]+$/.test(repository) ||
       repository.split('/').some((part) => part === '.' || part === '..') ||
       typeof revision !== 'string' || !/^[0-9a-f]{40}$/.test(revision) ||

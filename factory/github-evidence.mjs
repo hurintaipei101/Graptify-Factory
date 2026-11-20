@@ -173,14 +173,15 @@ export function createGitHubEvidenceProviders({ pullRequest, fetchImpl } = {}) {
     return {
       mode, kind, principal,
       async run(input, { signal } = {}) {
-        const { repository, revision } = input;
+        const { issueKey, linearIssueId, repository, approvalDigest, memoryScope, revision } = input;
+        const binding = { issueKey, linearIssueId, repository, approvalDigest, memoryScope };
         const options = { repository, signal };
         if (!validRepository(repository) || !sha(revision) || !validPullRequest(pullRequest)) {
-          return { revision, status: 'BLOCKED', reason: 'invalid approved repository, PR number or candidate SHA' };
+          return { ...binding, revision, status: 'BLOCKED', reason: 'invalid approved repository, PR number or candidate SHA' };
         }
         const { details, ...result } = await inspect(input, options);
         return {
-          ...result, revision,
+          ...result, ...binding, revision,
           evidence: { mode, source, repository, pull_request: pullRequest, observed_at: new Date().toISOString(), ...details },
         };
       },
@@ -206,7 +207,8 @@ export function createGitHubEvidenceProviders({ pullRequest, fetchImpl } = {}) {
     const blocked = await readCandidateHead(input, options);
     if (blocked) return blocked;
     const { checks, ...result } = await inspectGitHubChecks({
-      ...input, ...options, read: (endpoint) => read(endpoint, options),
+      revision: input.revision, requiredChecks: input.requiredChecks, ...options,
+      read: (endpoint) => read(endpoint, options),
     });
     const details = checks ? { app: 'github-actions', app_id: 15368, checks } : undefined;
     if (result.status === 'FAIL') {

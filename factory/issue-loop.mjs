@@ -16,6 +16,9 @@ const STAGES = ['coding', 'tests', 'ci', 'review'];
 const KINDS = { coding: 'agent', tests: 'deterministic', ci: 'read-only', review: 'agent' };
 const GITHUB_REFRESH_INTERVAL_MS = 5_000;
 const ACTIVE_CLAIM = 'run is active or interrupted; reconcile persisted state before taking further action';
+const PROVIDER_BINDING_VERSION = 1;
+const INVALID_PROVIDER_BINDING = 'INVALID_PROVIDER_BINDING';
+const PROVIDER_BINDING_FIELDS = ['issueKey', 'linearIssueId', 'repository', 'approvalDigest', 'memoryScope'];
 // Match the reasons already persisted in issue reports, including reports from before refresh was supported.
 const RECOVERABLE_GITHUB_BLOCKS = new Set([
   'required GitHub checks are still pending after three reads',
@@ -136,13 +139,24 @@ function canResumeVerification(report) {
 }
 
 async function replay({ directory, fingerprint, report, resume, recheck, decision }) {
+  function replayBlock(stored) {
+    if (stored.providerBindingVersion !== PROVIDER_BINDING_VERSION) {
+      return decision(report, 'BLOCKED', 'stored claim predates required provider approval binding; reconcile the claim',
+        'UNVERIFIED_STORED_BINDING');
+    }
+    if (stored.fingerprint !== fingerprint) {
+      return decision(report, 'BLOCKED', 'issue already claimed with different approved inputs');
+    }
+    return null;
+  }
   let stored;
   try {
     stored = await readStoredRun(directory);
   } catch {
     return decision(report, 'BLOCKED', 'run is claimed but persisted state is unavailable; reconcile before taking further action');
   }
-  if (stored.fingerprint !== fingerprint) return decision(report, 'BLOCKED', 'issue already claimed with different approved inputs');
+  const blocked = replayBlock(stored);
+  if (blocked) return blocked;
   if (stored.report.status === 'RUNNING' && !canResumeVerification(stored.report)) {
     return decision(stored.report, 'BLOCKED', ACTIVE_CLAIM);
   }
@@ -159,7 +173,8 @@ async function replay({ directory, fingerprint, report, resume, recheck, decisio
   try {
     // A worker may have refreshed between our first read and acquiring the claim.
     stored = await readStoredRun(directory);
-    if (stored.fingerprint !== fingerprint) return decision(report, 'BLOCKED', 'issue already claimed with different approved inputs');
+    const blocked = replayBlock(stored);
+    if (blocked) return blocked;
     const save = async (current) => {
       stored.report = current;
       await persist(directory, stored);
@@ -208,11 +223,13 @@ function compactFindings(findings, stage, allowedChecks) {
 }
 
 function matchesBinding(result, input) {
-  if (!result) return false;
-  return ['issueKey', 'linearIssueId', 'repository', 'baseRevision', 'approvalDigest'].every((field) =>
-    result[field] === undefined || result[field] === input[field]) &&
-    (result.memoryScope === undefined || (validMemoryScope(result.memoryScope) &&
-      MEMORY_SCOPE_FIELDS.every((field) => result.memoryScope[field] === input.memoryScope[field])));
+  return result && typeof result === 'object' && !Array.isArray(result) &&
+    PROVIDER_BINDING_FIELDS.every((field) => Object.hasOwn(result, field)) &&
+    result.issueKey === input.issueKey && result.linearIssueId === input.linearIssueId &&
+    result.repository === input.repository && result.approvalDigest === input.approvalDigest &&
+    validMemoryScope(result.memoryScope) &&
+    MEMORY_SCOPE_FIELDS.every((field) => result.memoryScope[field] === input.memoryScope[field]) &&
+    (result.baseRevision === undefined || result.baseRevision === input.baseRevision);
 }
 
 class ProviderDeadline extends Error {}
@@ -245,17 +262,15 @@ async function callProvider(run, input, budget) {
   }
 }
 
-async function verifyCandidate({ providers, approval, profile, revision, report, cycle, budget, pollIntervalMs, recordCheck,
+async function verifyCandidate({ providers, approval, approvalBinding, profile, revision, report, cycle, budget, pollIntervalMs, recordCheck,
   stages = STAGES.slice(1), ciReads = 3 }) {
-  const input = {
-    issueKey: profile.issue_key, linearIssueId: profile.linear_issue_id ?? null, repository: approval.repository,
-    revision, approvalDigest: approval.profileDigest, memoryScope: profile.memory_scope,
-  };
+  const input = { ...approvalBinding, revision };
   for (const stage of stages) {
     const args = stage === 'tests' ? { ...input, acceptanceTests: profile.acceptance_tests }
       : stage === 'ci' ? { ...input, requiredChecks: approval.requiredChecks }
       : { ...input, baseline: approval.baseline, requirements: profile.requirements, acceptanceTests: profile.acceptance_tests };
     let result;
+    let invalidBinding = false;
     let reads = 0;
     const github = approval.githubPullRequest !== undefined && stage !== 'tests';
     const maxReads = stage === 'ci' ? ciReads : 1;
@@ -264,7 +279,8 @@ async function verifyCandidate({ providers, approval, profile, revision, report,
         if (reads > 0) await delay(pollIntervalMs, undefined, { signal: budget.signal });
         reads += 1;
         result = await callProvider(providers[stage].run, args, budget);
-      } while (result?.status === 'PENDING' && result.revision === revision && matchesBinding(result, args) && reads < maxReads);
+        invalidBinding = !matchesBinding(result, args);
+      } while (!invalidBinding && result.status === 'PENDING' && result.revision === revision && reads < maxReads);
     } catch (error) {
       const interrupted = budget.signal.aborted || error instanceof ProviderDeadline;
       if (!interrupted) return { status: 'BLOCKED', reason: 'provider invocation failed' };
@@ -273,25 +289,29 @@ async function verifyCandidate({ providers, approval, profile, revision, report,
       }
       result = { status: 'BLOCKED', revision, reason: 'GitHub evidence read deadline reached' };
     }
-    const bound = result?.revision === revision && matchesBinding(result, args);
+    const bound = !invalidBinding && result?.revision === revision;
     const findings = bound && result.status === 'FAIL' ? compactFindings(result.findings, stage, approval.requiredChecks) : [];
     let status = result?.status;
     if (!['PASS', 'FAIL', 'GATE_A'].includes(status) || !bound ||
         (status === 'FAIL' && findings.length === 0)) status = 'BLOCKED';
-    const classification = result?.revision != null && result.revision !== revision ? 'STALE'
+    const classification = invalidBinding ? 'UNRESOLVED'
+      : result?.revision != null && result.revision !== revision ? 'STALE'
       : status === 'PASS' ? 'CLEAN'
       : status === 'FAIL' ? 'FAILED'
       : bound && github && result.classification === 'STALE' ? 'STALE'
       : bound && (result.status === 'PENDING' || (github && result.classification === 'PENDING')) ? 'PENDING'
       : 'UNRESOLVED';
     const check = { cycle, revision, stage, status, classification, reads, findings: findings.map(({ id }) => id) };
+    if (invalidBinding) check.reason_code = INVALID_PROVIDER_BINDING;
     if (github && bound && result.evidence) check.evidence = result.evidence;
     if (github && bound && result.reason) check.reason = result.reason;
-    const reason = check.reason ?? (stage === 'ci' && classification === 'PENDING'
+    const reason = invalidBinding ? `${stage} provider returned an invalid approval binding`
+      : check.reason ?? (stage === 'ci' && classification === 'PENDING'
       ? (ciReads === 3 ? 'required GitHub checks are still pending after three reads' : 'required GitHub checks are still pending')
       : `${stage} provider did not supply usable verification for the candidate revision`);
     report.checks.push(check);
     await recordCheck(check, status === 'BLOCKED' ? reason : undefined);
+    if (invalidBinding) return { status, reason, reasonCode: INVALID_PROVIDER_BINDING };
     if (externallyCancelled(budget)) return { status: 'BLOCKED', reason: interruptionReason(budget), interrupted: true };
     if (status === 'BLOCKED') return { status, reason };
     if (status === 'GATE_A') return { status, reason: `${stage} reported a scope, security or permission boundary` };
@@ -336,6 +356,10 @@ export async function runIssueLoop({
   profile = structuredClone(Object.fromEntries(PROFILE_FIELDS.map((key) => [key, profile[key]])));
   const { profileDigest, repository, environment, baseline, requiredChecks, githubPullRequest } = approval;
   approval = { profileDigest, repository, environment, baseline, requiredChecks: [...requiredChecks], githubPullRequest };
+  const approvalBinding = {
+    issueKey: profile.issue_key, linearIssueId: profile.linear_issue_id ?? profile.issue_key,
+    repository, approvalDigest: profileDigest, memoryScope: profile.memory_scope,
+  };
   const githubProviders = githubPullRequest === undefined ? null
     : createGitHubEvidenceProviders({ pullRequest: githubPullRequest, fetchImpl: githubEvidenceFetch });
   if (githubProviders) providers = { ...providers, ...githubProviders };
@@ -358,15 +382,15 @@ export async function runIssueLoop({
     });
     inputs.push('codex-cli-simulation', workspace);
   }
-  const fingerprint = hash(inputs);
+  const fingerprint = hash([...inputs, PROVIDER_BINDING_VERSION]);
   report.feedback_binding = {
-    issue_key: report.issue_key, linear_issue_id: profile.linear_issue_id ?? null, repository,
+    issue_key: report.issue_key, linear_issue_id: approvalBinding.linearIssueId, repository,
     pull_request: githubPullRequest ?? null, approval_digest: profileDigest, run_fingerprint: fingerprint,
     memory_scope: profile.memory_scope,
   };
   const directory = join(stateDirectory, report.run_id);
   const lock = join(directory, 'github-refresh');
-  const save = (current) => persist(directory, { fingerprint, report: current });
+  const save = (current) => persist(directory, { fingerprint, providerBindingVersion: PROVIDER_BINDING_VERSION, report: current });
   if (signal?.aborted) return decision(report, 'BLOCKED', 'execution cancelled');
   try {
     await mkdir(stateDirectory, { recursive: true, mode: 0o700 });
@@ -406,14 +430,16 @@ export async function runIssueLoop({
     });
   }
 
-  function decision(current, status, reason) {
-    record(current, 'DECISION', { status, reason });
-    return finish(current, status, reason);
+  function decision(current, status, reason, reasonCode) {
+    record(current, 'DECISION', { status, reason, reason_code: reasonCode });
+    const result = finish(current, status, reason);
+    if (reasonCode) result.reason_code = reasonCode;
+    return result;
   }
 
   function checkRecorder(current, save) {
-    return async ({ stage, status, classification, reads, findings, evidence }, reason) => {
-      record(current, 'VERIFICATION', { stage, status, classification, reads, findings, evidence, reason });
+    return async ({ stage, status, classification, reads, findings, evidence, reason_code }, reason) => {
+      record(current, 'VERIFICATION', { stage, status, classification, reads, findings, evidence, reason, reason_code });
       await save(current);
     };
   }
@@ -491,11 +517,10 @@ export async function runIssueLoop({
         let coded;
         try {
           const input = {
-            issueKey: report.issue_key, linearIssueId: profile.linear_issue_id ?? null, repository,
-            githubPullRequest, approvalDigest: profileDigest, runId: report.run_id, cycle,
+            ...approvalBinding, githubPullRequest, runId: report.run_id, cycle,
             baseRevision: report.revision ?? approval.baseline, model: profile.model,
             requirements: profile.requirements, acceptanceTests: profile.acceptance_tests,
-            forbiddenOperations: profile.forbidden_operations, memoryScope: profile.memory_scope, findings,
+            forbiddenOperations: profile.forbidden_operations, findings,
           };
           if (runCodex) {
             if (deadlineReached(budget)) return { status: 'BLOCKED', reason: interruptionReason(budget) };
@@ -521,9 +546,11 @@ export async function runIssueLoop({
             await save(report);
           }
           coded = await callProvider(providers.coding.run, input, budget);
-          if (coded && (!matchesBinding(coded, input) || (runCodex && coded.status !== 'GATE_A' &&
-              (coded.issueKey !== input.issueKey || coded.repository !== input.repository || coded.baseRevision !== input.baseRevision)))) {
-            return { status: 'BLOCKED', reason: 'coding candidate does not match the dispatched issue, repository or base revision' };
+          if (!matchesBinding(coded, input) || (runCodex && coded.status !== 'GATE_A' && coded.baseRevision !== input.baseRevision)) {
+            return {
+              status: 'BLOCKED', reason: 'coding candidate does not match the dispatched approval binding or base revision',
+              reasonCode: INVALID_PROVIDER_BINDING,
+            };
           }
           if (coded?.status === 'GATE_A') return { status: 'GATE_A', reason: 'coding reported a scope, security or permission boundary' };
           if (coded?.status !== 'PASS' || typeof coded.revision !== 'string' ||
@@ -553,12 +580,12 @@ export async function runIssueLoop({
     else delete current.verification_pending;
     const status = outcome.status === 'PASS' ? 'READY' : outcome.status;
     const nextAction = status === 'GATE_A' ? `${outcome.reason}. Owner decision required to revise scope or stop the issue` : outcome.reason;
-    return decision(current, status, nextAction);
+    return decision(current, status, nextAction, outcome.reasonCode);
   }
 
   function verifyAttempt(current, save, budget) {
     return verifyCandidate({
-      providers, approval, profile, revision: current.revision, report: current, cycle: current.repair_cycles,
+      providers, approval, approvalBinding, profile, revision: current.revision, report: current, cycle: current.repair_cycles,
       budget, pollIntervalMs, recordCheck: checkRecorder(current, save),
     });
   }
@@ -569,7 +596,7 @@ export async function runIssueLoop({
     current.reviewer.verdict = current.checks.find((check) =>
       check.cycle === attempt.cycle && check.stage === 'review')?.status ?? 'UNKNOWN';
     record(current, 'ATTEMPT_RESULT', {
-      status: outcome.status, reason: outcome.reason,
+      status: outcome.status, reason: outcome.reason, reason_code: outcome.reasonCode,
     });
     await save(current);
   }
@@ -602,10 +629,10 @@ export async function runIssueLoop({
     return withBudget(async (budget) => {
       const saveAudit = () => save({ ...stored, feedback: current.feedback, feedback_binding: current.feedback_binding });
       const outcome = await verifyCandidate({
-        providers, approval, profile, revision: current.revision, report: current, cycle, budget, pollIntervalMs,
+        providers, approval, approvalBinding, profile, revision: current.revision, report: current, cycle, budget, pollIntervalMs,
         stages: ['ci', 'review'], ciReads: 1, recordCheck: checkRecorder(current, saveAudit),
       });
-      if (externallyCancelled(budget)) {
+      if (externallyCancelled(budget) && !outcome.reasonCode) {
         record(current, 'DECISION', { status: 'BLOCKED', reason: 'execution cancelled during GitHub evidence refresh' });
         await saveAudit();
         return null;
