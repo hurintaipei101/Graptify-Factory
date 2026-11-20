@@ -43,7 +43,7 @@ function findingSeverity(body) {
 }
 
 function verifyReview(pr, revision, nowMs) {
-  const blocked = (reason, details) => ({ status: 'BLOCKED', reason, details });
+  const blocked = (reason, details, classification = 'UNRESOLVED') => ({ status: 'BLOCKED', reason, details, classification });
   if (!fullConnection(pr.reviews) || !fullConnection(pr.reviewThreads)) {
     return blocked('GitHub review or thread response is invalid or incomplete');
   }
@@ -58,12 +58,19 @@ function verifyReview(pr, revision, nowMs) {
   const codexReviews = [...byId.values()].filter(({ author }) => isCodex(author));
   const current = codexReviews.filter(({ commit }) => commit?.oid === revision);
   if (codexReviews.some(({ state, commit }) => state === 'PENDING' && (!commit || commit.oid === revision))) {
-    return blocked('Codex review is pending');
+    return blocked('Codex review is pending', undefined, 'PENDING');
   }
-  if (current.length === 0) return blocked('no trusted Codex review is bound to the candidate SHA');
+  if (current.length === 0) {
+    const priorReviews = codexReviews.filter(({ commit }) => sha(commit?.oid));
+    return blocked('no trusted Codex review is bound to the candidate SHA',
+      { prior_reviews: priorReviews.map(({ id, commit }) => ({ id, sha: commit.oid })) },
+      priorReviews.length ? 'STALE' : 'PENDING');
+  }
   if (current.length !== 1) return blocked('multiple trusted Codex reviews are bound to the candidate SHA');
   const [review] = current;
-  if (!isFreshGitHubTimestamp(review.submittedAt, nowMs)) return blocked('Codex review completion is stale or invalid');
+  if (!isFreshGitHubTimestamp(review.submittedAt, nowMs)) {
+    return blocked('Codex review completion is stale or invalid', { review_id: review.id }, 'STALE');
+  }
   const details = {
     author: CODEX, review_id: review.id, state: review.state, submitted_at: review.submittedAt, findings: [],
   };
@@ -91,7 +98,7 @@ function verifyReview(pr, revision, nowMs) {
     if (!severity) {
       return blocked('Codex finding format is unrecognized', details);
     }
-    if (thread.isResolved || !['P0', 'P1'].includes(severity)) continue;
+    if (thread.isResolved || severity === 'P3') continue;
     if (findings.length === 8) return blocked('Codex findings exceed the repair evidence limit', details);
     details.findings.push({ thread_id: thread.id, comment_id: comment.id, severity });
     findings.push({ id: comment.id, summary: `Resolve the open Codex ${severity} finding in GitHub` });
@@ -180,19 +187,34 @@ export function createGitHubEvidenceProviders({ pullRequest, fetchImpl } = {}) {
     };
   }
 
-  const ci = provider('read-only', 'github-actions', async (input, options) => {
-    const { repository, revision } = input;
+  async function readCandidateHead({ repository, revision }, options) {
     const response = await read(`repos/${repository}/pulls/${pullRequest}`, options);
     if (!response.ok) return { status: 'BLOCKED', reason: response.reason };
     const pr = response.value;
     if (!sameRepo(pr?.base?.repo?.full_name, repository) || !sameRepo(pr?.head?.repo?.full_name, repository) ||
-        pr.number !== pullRequest || pr.state !== 'open' || pr.head.sha !== revision) {
+        pr.number !== pullRequest || pr.state !== 'open' || !sha(pr.head.sha)) {
       return { status: 'BLOCKED', reason: 'GitHub pull request does not match the repository and candidate head' };
     }
+    if (pr.head.sha !== revision) return {
+      status: 'BLOCKED', classification: 'STALE', details: { observed_head_sha: pr.head.sha },
+      reason: 'GitHub pull request does not match the repository and candidate head',
+    };
+    return null;
+  }
+
+  const ci = provider('read-only', 'github-actions', async (input, options) => {
+    const blocked = await readCandidateHead(input, options);
+    if (blocked) return blocked;
     const { checks, ...result } = await inspectGitHubChecks({
       ...input, ...options, read: (endpoint) => read(endpoint, options),
     });
-    return { ...result, details: checks ? { app: 'github-actions', app_id: 15368, checks } : undefined };
+    const details = checks ? { app: 'github-actions', app_id: 15368, checks } : undefined;
+    if (result.status === 'FAIL') {
+      // A failing check can authorize a repair without going through the review provider's head check.
+      const changed = await readCandidateHead(input, options);
+      if (changed) return { ...changed, details: { ...details, ...changed.details } };
+    }
+    return { ...result, details };
   });
 
   const review = provider('read-only', CODEX, async ({ repository, revision }, options) => {
@@ -204,9 +226,13 @@ export function createGitHubEvidenceProviders({ pullRequest, fetchImpl } = {}) {
     const repo = response.value?.data?.repository;
     const pr = repo?.pullRequest;
     if (!sameRepo(repo?.nameWithOwner, repository) || !sameRepo(pr?.headRepository?.nameWithOwner, repository) ||
-        pr.number !== pullRequest || pr.state !== 'OPEN' || pr.headRefOid !== revision) {
+        pr.number !== pullRequest || pr.state !== 'OPEN' || !sha(pr.headRefOid)) {
       return { status: 'BLOCKED', reason: 'GitHub review is for a different repository, PR or candidate head' };
     }
+    if (pr.headRefOid !== revision) return {
+      status: 'BLOCKED', classification: 'STALE', details: { observed_head_sha: pr.headRefOid },
+      reason: 'GitHub review is for a different repository, PR or candidate head',
+    };
     return verifyReview(pr, revision, Date.now());
   });
   return { ci, review };

@@ -45,7 +45,7 @@ Register simulation providers with `mode: 'SIMULATION'`, a distinct coding and r
 
 Verification providers return `{ status, revision }`. A repairable `FAIL` must include one to eight `findings` with an `id` and a short `summary`. Use `BLOCKED` for unavailable controls and `GATE_A` for scope, security or privilege exceptions. The loop gives coding only the approved criteria and the previous attempt's findings. It checks tests, CI, and review in that order with at most three reads of pending CI per candidate and one initial attempt plus three repairs.
 
-The loop returns a compact `factory.issue_run_report.v1` with `READY`, `BLOCKED`, or `GATE_A`. Identical invocations replay the stored report. Concurrent calls, interrupted claims, and changed inputs for a claimed issue block dispatch. Reconcile an interrupted claim before authorizing any new execution. Keep simulation evidence labeled as such. Live dispatch remains disabled even when requested, pending verified write isolation, CI access, and independent review. This entry point exposes no merge or deployment operations.
+The loop returns a `factory.issue_run_report.v1` with `READY`, `BLOCKED`, or `GATE_A`. Identical invocations replay the stored report or resume verification from a durable checkpoint. Concurrent calls, uncertain dispatches, and changed inputs for a claimed issue block dispatch. Keep simulation evidence labeled as such. Live dispatch remains disabled even when requested, pending verified write isolation, CI access, and independent review. This entry point exposes no merge or deployment operations.
 
 ## F2-09A GitHub evidence
 
@@ -55,7 +55,7 @@ Identical replay can refresh GitHub evidence for a `READY` claim or a `BLOCKED` 
 
 The live providers use GitHub.com's API and the existing repository-scoped Actions job token. An eligible job needs `checks: read` and `pull-requests: read` and can expose `${{ github.token }}` as `GITHUB_TOKEN` or `GH_TOKEN`. The current Node 22 job declares `contents: read` for checkout. Jobs without the evidence permissions or token return `BLOCKED`.
 
-Successful verification requires a matching open PR head, the approved check names from the GitHub Actions App, and an explicit `APPROVED` review by `chatgpt-codex-connector` bound to that full SHA. Check completions and submitted reviews expire after 24 hours. The provider reads thread resolution and records exact-candidate Codex P0/P1 findings for targeted repair. A `COMMENTED` receipt supplies findings when verifiable. It supplies no approval. A thumbs-up on the PR lacks a candidate SHA and leaves the verdict blocked. The report stores GitHub identifiers, source, and timestamps without review bodies or credentials.
+Successful verification requires a matching open PR head, the approved check names from the GitHub Actions App, and an explicit `APPROVED` review by `chatgpt-codex-connector` bound to that full SHA. Check completions and submitted reviews expire after 24 hours. A `COMMENTED` receipt can supply verifiable findings and leaves the approval requirement in force. A thumbs-up on the PR lacks a candidate SHA and leaves the verdict blocked. The report stores GitHub identifiers, source, and timestamps without review bodies or credentials.
 
 ## F2-09B Codex dispatch
 
@@ -80,3 +80,11 @@ Download `isolation-evidence.json` from the run or read the same report in the r
 | GitHub read permissions and invalid-permission negative | The evidence job uses `contents: read`, `checks: read` and `pull-requests: read`. A separate job with only `contents: read` must get an explicit permission denial before the negative control can pass. If public reads or an ambiguous API failure prevent proving the permission boundary, the control stays `BLOCKED`. | Existing evidence fixtures cover HTTP and GraphQL failures. |
 
 After the change is reviewed and merged by a maintainer, manually dispatch the smoke from trusted main and retain the artifact. Keep live coding dispatch disabled while the remaining controls are blocked.
+
+## F2-09C automated feedback
+
+Use the same `runIssueLoop` entry point and replay the same approved inputs for subsequent observations. Each check records a `classification` of `CLEAN`, `FAILED`, `PENDING`, `STALE`, or `UNRESOLVED`. A failed required check or an open, exact-candidate Codex P0, P1, or P2 finding can produce a targeted simulated repair. CI is checked before review. When a required check fails, the CI provider rechecks the PR head before returning actionable findings. New candidates require fresh checks and review. The third unsuccessful repair and verification cycle stops at Gate A. A `READY` receipt indicates candidate verification and leaves release acceptance at Gate B.
+
+`feedback_binding` records the issue, repository, PR, approval digest, claim fingerprint, and approved `memory_scope` shared by every `feedback` entry. Each entry identifies the cycle and candidate SHA. Before the first candidate exists, the dispatch claim records the approved base SHA. The audit preserves check metadata, decisions, and targeted finding IDs across refreshes. The working report continues to expose the latest checks for each attempt.
+
+Cancellation during verification preserves the candidate checkpoint and completed checks. Replay re-verifies that SHA and claims a repair only if current evidence warrants one. During cancellation or process exit before candidate handoff, the dispatch claim stays held pending reconciliation. If a process exits while holding the run's `github-refresh` lock, confirm the previous worker and its children have stopped before removing the abandoned lock from the issue's state directory. Keep `state.json` intact. A persisted candidate checkpoint allows verification to resume. A claim without a candidate checkpoint remains blocked.

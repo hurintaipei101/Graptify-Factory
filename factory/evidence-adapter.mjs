@@ -72,7 +72,9 @@ export async function inspectGitHubChecks({ repository, revision, requiredChecks
       missing.push(name);
       continue;
     }
-    if (check.head_sha !== revision) return result('BLOCKED', { reason: 'GitHub check run is for a different SHA' });
+    if (check.head_sha !== revision) return result('BLOCKED', {
+      reason: 'GitHub check run is for a different SHA', classification: 'STALE',
+    });
     if (read && (!hasGitHubActionsProvenance(check, repository) || checks.some(({ id }) => id === check.id))) {
       return result('BLOCKED', { reason: 'required check run has unverified GitHub Actions provenance' });
     }
@@ -86,7 +88,9 @@ export async function inspectGitHubChecks({ repository, revision, requiredChecks
     }
     if (read) {
       if (!isFreshGitHubTimestamp(check.completed_at, nowMs)) {
-        return result('BLOCKED', { reason: 'required GitHub check has a stale or invalid completion time' });
+        return result('BLOCKED', {
+          reason: 'required GitHub check has a stale or invalid completion time', classification: 'STALE',
+        });
       }
       checks.push({ id: check.id, name, conclusion: check.conclusion, completed_at: check.completed_at });
     }

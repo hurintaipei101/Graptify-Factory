@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
-import { EventEmitter } from 'node:events';
-import { mkdir, mkdtemp, readFile, rm, unlink, writeFile } from 'node:fs/promises';
+import { spawn } from 'node:child_process';
+import { EventEmitter, once } from 'node:events';
+import { mkdir, mkdtemp, readFile, rm, rmdir, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -270,6 +271,15 @@ test('binds GitHub API evidence to the issue claim and persists compact simulate
     ['chatgpt-codex-connector', 'PRR_1', 'APPROVED']);
   const stored = JSON.parse(await readFile(join(options.stateDirectory, report.run_id, 'state.json'), 'utf8'));
   assert.deepEqual(stored.report, report);
+  assert.deepEqual(report.feedback_binding, {
+    issue_key: options.profile.issue_key, linear_issue_id: null, repository, pull_request: pullRequest,
+    approval_digest: options.approval.profileDigest, run_fingerprint: stored.fingerprint,
+    memory_scope: options.profile.memory_scope,
+  });
+  const verdicts = report.feedback.filter(({ event }) => event === 'VERIFICATION');
+  assert.deepEqual(verdicts.map(({ stage, classification, candidate_sha }) => [stage, classification, candidate_sha]), [
+    ['tests', 'CLEAN', candidate(0)], ['ci', 'CLEAN', candidate(0)], ['review', 'CLEAN', candidate(0)],
+  ]);
   assert.match((await runIssueLoop({ ...options, githubEvidenceFetch: undefined })).next_action, /different approved inputs/);
   assert.match((await runIssueLoop({ ...options, approval: { ...options.approval, githubPullRequest: 43 } })).next_action,
     /different approved inputs/);
@@ -279,6 +289,7 @@ test('binds GitHub API evidence to the issue claim and persists compact simulate
   const replay = await runIssueLoop(options);
   assert.equal(replay.status, 'BLOCKED');
   assert.match(replay.next_action, /candidate head/);
+  assert.equal(replay.checks.at(-1).classification, 'STALE');
   assert.equal(calls.length, 4);
 });
 
@@ -364,6 +375,107 @@ test('a resolved Codex finding does not supply approval on its own', async (t) =
   assert.equal(report.status, 'BLOCKED');
   assert.match(report.next_action, /no verifiable approval/);
   assert.equal(report.repair_cycles, 0);
+});
+
+test('repairs only open P1 and P2 findings and invalidates evidence when coding returns a new SHA', async (t) => {
+  const options = await fixture(t);
+  let head = candidate(0);
+  const prompts = [];
+  codexFixture(options, ({ args }) => {
+    prompts.push(JSON.parse(args.at(-1)));
+    return successfulCodexChild();
+  });
+  const coding = options.providers.coding.run;
+  options.providers.coding.run = (input) => {
+    const output = coding(input);
+    head = output.revision;
+    return output;
+  };
+  githubFixture(options, ({ pr, review, thread }) => {
+    review.commit.oid = candidate(0);
+    review.state = 'COMMENTED';
+    if (head !== candidate(0)) return;
+    for (const [number, severity, resolved] of [[1, 'P1', false], [2, 'P2', false], [3, 'P3', false], [4, 'P2', true]]) {
+      const finding = structuredClone(thread);
+      finding.id = `PRRT_${number}`;
+      finding.isResolved = resolved;
+      const [root] = finding.comments.nodes;
+      root.id = `PRRC_${number}`;
+      root.body = root.body.replaceAll('P1', severity);
+      pr.reviewThreads.nodes.push(finding);
+    }
+  }, () => head);
+  const report = await runIssueLoop(options);
+  assert.equal(report.status, 'BLOCKED');
+  assert.equal(report.revision, candidate(1));
+  assert.equal(report.repair_cycles, 1);
+  assert.equal(prompts.length, 2);
+  const request = prompts[1];
+  assert.equal(request.baseRevision, candidate(0));
+  assert.equal(request.issueKey, options.profile.issue_key);
+  assert.equal(request.approvalDigest, options.approval.profileDigest);
+  assert.deepEqual(request.memoryScope, options.profile.memory_scope);
+  assert.deepEqual(request.findings.map(({ id }) => id), ['PRRC_1', 'PRRC_2']);
+  const [original, stale] = report.checks.filter(({ stage }) => stage === 'review');
+  assert.equal(original.classification, 'FAILED');
+  assert.equal(original.evidence.state, 'COMMENTED');
+  assert.equal(stale.classification, 'STALE');
+  assert.deepEqual(stale.findings, []);
+  assert.deepEqual(stale.evidence.prior_reviews, [{ id: 'PRR_1', sha: candidate(0) }]);
+  const claim = report.feedback.find(({ event }) => event === 'REPAIR_CLAIM');
+  assert.equal(claim.candidate_sha, candidate(0));
+  assert.deepEqual(claim.findings, [{ stage: 'review', id: 'PRRC_1' }, { stage: 'review', id: 'PRRC_2' }]);
+  const handoff = report.feedback.filter(({ event }) => event === 'CANDIDATE_HANDOFF').at(-1);
+  assert.deepEqual([handoff.candidate_sha, handoff.invalidated_sha], [candidate(1), candidate(0)]);
+  assert.ok(!JSON.stringify(report).includes('Fixture finding'));
+  await runIssueLoop(options);
+  assert.equal(prompts.length, 2);
+});
+
+test('a head change during a failing CI read prevents any repair', async (t) => {
+  const options = await fixture(t);
+  let head = candidate(0);
+  githubFixture(options, ({ path, run }) => {
+    if (path.endsWith('/check-runs')) {
+      run.conclusion = 'failure';
+      head = candidate(1);
+    }
+  }, () => head);
+  options.providers.coding.run = ({ cycle }) => {
+    assert.equal(cycle, 0);
+    return pass({ revision: candidate(0) });
+  };
+  const report = await runIssueLoop(options);
+  assert.equal(report.status, 'BLOCKED');
+  assert.equal(report.attempts.length, 1);
+  const stale = report.checks.at(-1);
+  assert.equal(stale.classification, 'STALE');
+  assert.equal(stale.evidence.observed_head_sha, candidate(1));
+  assert.deepEqual(stale.findings, []);
+  assert.ok(!report.feedback.some(({ event }) => event === 'REPAIR_CLAIM'));
+});
+
+test('verification rejects mismatched issue, SHA, approval digest and memory scope', async (t) => {
+  for (const [field, value] of [
+    ['issueKey', 'F2-99'], ['revision', candidate(1)], ['approvalDigest', 'wrong'],
+    ['memoryScope', { short_term: 'issue', long_term: 'project/module', allow_customer_data: true }],
+  ]) {
+    await t.test(field, async (t) => {
+      const options = await fixture(t);
+      const coding = options.providers.coding.run;
+      options.providers.coding.run = (input) => {
+        assert.equal(input.cycle, 0);
+        return coding(input);
+      };
+      options.providers.ci.run = ({ revision }) => ({ ...failure(revision, check), [field]: value });
+      options.providers.review.run = () => assert.fail('must not use unbound evidence');
+      const report = await runIssueLoop(options);
+      assert.equal(report.status, 'BLOCKED');
+      assert.equal(report.repair_cycles, 0);
+      assert.deepEqual(report.checks.at(-1).findings, []);
+      assert.ok(!report.feedback.some(({ event }) => event === 'REPAIR_CLAIM'));
+    });
+  }
 });
 
 test('an unavailable Actions login blocks live evidence without relabeling it as simulated', async (t) => {
@@ -554,7 +666,7 @@ test('a previous replay that persisted FAIL rechecks GitHub before resuming', as
   assert.equal(gate.repair_cycles, 1);
   assert.equal(prompt.cycle, 1);
   assert.deepEqual(prompt.findings.map(({ id }) => id), [check]);
-  assert.equal(calls.length, 8);
+  assert.equal(calls.length, 9);
 });
 
 test('concurrent replay acknowledges a durable repair claim and dispatches it once', async (t) => {
@@ -767,7 +879,16 @@ test('cancelling CI or review refresh preserves the durable report and permits a
       const after = JSON.parse(await readFile(statePath, 'utf8'));
       assert.equal(after.githubRefreshStartedAt, now);
       assert.equal(after.fingerprint, before.fingerprint);
-      assert.deepEqual(after.report, before.report);
+      const { feedback: audit, ...preserved } = after.report;
+      const { feedback: originalAudit, ...original } = before.report;
+      assert.deepEqual(preserved, original);
+      assert.deepEqual(audit.slice(0, originalAudit.length), originalAudit);
+      assert.equal(audit.at(-1).status, 'BLOCKED');
+      assert.match(audit.at(-1).reason, /execution cancelled/);
+      if (stage === 'review') {
+        assert.equal(audit.at(-2).stage, 'ci');
+        assert.equal(audit.at(-2).classification, 'CLEAN');
+      }
       const readsAfterCancel = calls.length;
       assert.equal((await runIssueLoop(options)).status, 'BLOCKED');
       assert.equal(calls.length, readsAfterCancel);
@@ -835,6 +956,75 @@ test('retry after a cancelled refresh blocks invalid, stale, or unauthorized evi
   }
 });
 
+test('cancelling initial verification resumes the recorded SHA without coding again', async (t) => {
+  const options = await fixture(t);
+  const controller = new AbortController();
+  const checking = Promise.withResolvers();
+  let waiting = true;
+  let dispatches = 0;
+  codexFixture(options, () => { dispatches += 1; return successfulCodexChild(); });
+  githubFixture(options, ({ path }) => {
+    if (waiting && path === '/graphql') {
+      checking.resolve();
+      return new Promise(() => {});
+    }
+  });
+  const initial = runIssueLoop({ ...options, signal: controller.signal });
+  await checking.promise;
+  controller.abort();
+  const cancelled = await initial;
+  assert.equal(cancelled.status, 'BLOCKED');
+  assert.equal(cancelled.verification_pending, true);
+  assert.equal(cancelled.revision, candidate(0));
+  assert.deepEqual(cancelled.checks.map(({ stage }) => stage), ['tests', 'ci']);
+  assert.equal(cancelled.attempts[0].dispatch.candidate_revision, candidate(0));
+  assert.match(cancelled.feedback.at(-1).reason, /cancelled/);
+  waiting = false;
+  const resumed = await runIssueLoop(options);
+  assert.equal(resumed.status, 'READY');
+  assert.equal(resumed.revision, candidate(0));
+  assert.equal(resumed.verification_pending, undefined);
+  assert.equal(resumed.attempts.length, 1);
+  assert.equal(dispatches, 1);
+  assert.deepEqual(resumed.feedback.slice(0, cancelled.feedback.length), cancelled.feedback);
+  assert.equal(resumed.feedback[cancelled.feedback.length].event, 'VERIFICATION_RESUMED');
+});
+
+test('a process exit preserves candidate and check evidence for verification-only recovery', async (t) => {
+  const options = await fixture(t);
+  const childScript = `
+    const { runIssueLoop } = await import(process.argv[1]);
+    const options = JSON.parse(process.argv[2]);
+    const provider = (kind, principal, run) => ({ mode: 'SIMULATION', kind, principal, run });
+    const pass = ({ revision }) => ({ status: 'PASS', revision });
+    options.providers = {
+      coding: { ...provider('agent', 'coder', () => pass({ revision: process.argv[3] })), profile: options.profile.role_profile },
+      tests: provider('deterministic', 'node', pass),
+      ci: provider('read-only', 'ci', () => process.exit(75)),
+      review: provider('agent', 'reviewer', (input) => pass(input)),
+    };
+    await runIssueLoop(options);
+  `;
+  const child = spawn(process.execPath, ['--input-type=module', '--eval', childScript,
+    new URL('./issue-loop.mjs', import.meta.url).href, JSON.stringify(options), candidate(0)], { stdio: 'ignore' });
+  assert.deepEqual(await once(child, 'exit'), [75, null]);
+
+  options.providers.coding.run = () => assert.fail('known candidate must never be redispatched');
+  const interrupted = await runIssueLoop(options);
+  assert.equal(interrupted.status, 'BLOCKED');
+  assert.match(interrupted.next_action, /active or interrupted/);
+  assert.equal(interrupted.revision, candidate(0));
+  assert.deepEqual(interrupted.checks.map(({ stage, status }) => [stage, status]), [['tests', 'PASS']]);
+  // The child is confirmed dead, so the abandoned lock can be reconciled.
+  await rmdir(join(options.stateDirectory, interrupted.run_id, 'github-refresh'));
+  const resumed = await runIssueLoop(options);
+  assert.equal(resumed.status, 'READY');
+  assert.equal(resumed.revision, candidate(0));
+  assert.equal(resumed.attempts.length, 1);
+  assert.ok(resumed.feedback.some(({ event }) => event === 'VERIFICATION_RESUMED'));
+  assert.equal(resumed.feedback.filter(({ event }) => event === 'DISPATCH_CLAIM').length, 1);
+});
+
 test('runs targeted test, CI and independent review repairs and replays persisted evidence', async (t) => {
   const options = await fixture(t);
   const prompts = [];
@@ -875,7 +1065,9 @@ test('runs targeted test, CI and independent review repairs and replays persiste
   assert.equal(reads, 4);
   assert.deepEqual(await runIssueLoop({ ...options, providers: {}, evidence: {} }), report);
   assert.equal(prompts.length, 4);
-  assert.ok(JSON.stringify(report).length < 4096);
+  const { feedback, ...summary } = report;
+  assert.ok(JSON.stringify(summary).length < 4096);
+  assert.equal(feedback.filter(({ event }) => event === 'REPAIR_CLAIM').length, 3);
   assert.ok(!JSON.stringify(report).includes('Fix the failing assertion'));
 });
 
