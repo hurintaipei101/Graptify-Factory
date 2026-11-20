@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
-import { EventEmitter } from 'node:events';
-import { mkdir, mkdtemp, readFile, rm, unlink, writeFile } from 'node:fs/promises';
+import { spawn } from 'node:child_process';
+import { EventEmitter, once } from 'node:events';
+import { mkdir, mkdtemp, readFile, rm, rmdir, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -13,8 +14,11 @@ const check = 'Node 22 Tests';
 const pullRequest = 42;
 const candidate = (cycle) => String(cycle + 1).repeat(40);
 const provider = (kind, principal, run) => ({ mode: 'SIMULATION', kind, principal, run });
-const pass = ({ revision }) => ({ status: 'PASS', revision });
-const failure = (revision, id) => ({ status: 'FAIL', revision, findings: [{ id, summary: 'Fix the failing assertion' }] });
+function boundResult({ issueKey, linearIssueId, repository, approvalDigest, memoryScope, revision }, status) {
+  return { issueKey, linearIssueId, repository, approvalDigest, memoryScope, revision, status };
+}
+const pass = (input) => boundResult(input, 'PASS');
+const failure = (input, id) => ({ ...boundResult(input, 'FAIL'), findings: [{ id, summary: 'Fix the failing assertion' }] });
 
 async function fixture(t) {
   const directory = await mkdtemp(join(tmpdir(), 'factory-loop-'));
@@ -41,7 +45,7 @@ async function fixture(t) {
     },
   };
   const providers = {
-    coding: { ...provider('agent', 'coder', ({ cycle }) => ({ status: 'PASS', revision: candidate(cycle) })), profile: profile.role_profile },
+    coding: { ...provider('agent', 'coder', (input) => pass({ ...input, revision: candidate(input.cycle) })), profile: profile.role_profile },
     tests: provider('deterministic', 'node', pass),
     ci: provider('read-only', 'github-fixture', pass),
     review: provider('agent', 'reviewer', (input) => pass(input)),
@@ -55,8 +59,8 @@ function codexFixture(options, spawn) {
     workspace, allowedWorkspaces: [workspace], runtimeIsolation: { verified: true },
     mcpAccess: { verified: true, allowed: true }, spawnFixture: spawn,
   };
-  options.providers.coding.run = ({ issueKey, repository, baseRevision, cycle }) =>
-    ({ issueKey, repository, baseRevision, status: 'PASS', revision: candidate(cycle) });
+  options.providers.coding.run = (input) =>
+    ({ ...pass({ ...input, revision: candidate(input.cycle) }), baseRevision: input.baseRevision });
 }
 
 function codexChild() {
@@ -187,7 +191,7 @@ test('only the initial Codex dispatch and three repairs can run before Gate A', 
     bases.push(JSON.parse(args.at(-1)).baseRevision);
     return successfulCodexChild();
   });
-  options.providers.tests.run = ({ revision }) => failure(revision, 'T01');
+  options.providers.tests.run = (input) => failure(input, 'T01');
   const report = await runIssueLoop(options);
   assert.equal(report.status, 'GATE_A');
   assert.equal(report.owner_gate, 'A');
@@ -270,6 +274,15 @@ test('binds GitHub API evidence to the issue claim and persists compact simulate
     ['chatgpt-codex-connector', 'PRR_1', 'APPROVED']);
   const stored = JSON.parse(await readFile(join(options.stateDirectory, report.run_id, 'state.json'), 'utf8'));
   assert.deepEqual(stored.report, report);
+  assert.deepEqual(report.feedback_binding, {
+    issue_key: options.profile.issue_key, linear_issue_id: options.profile.issue_key, repository, pull_request: pullRequest,
+    approval_digest: options.approval.profileDigest, run_fingerprint: stored.fingerprint,
+    memory_scope: options.profile.memory_scope,
+  });
+  const verdicts = report.feedback.filter(({ event }) => event === 'VERIFICATION');
+  assert.deepEqual(verdicts.map(({ stage, classification, candidate_sha }) => [stage, classification, candidate_sha]), [
+    ['tests', 'CLEAN', candidate(0)], ['ci', 'CLEAN', candidate(0)], ['review', 'CLEAN', candidate(0)],
+  ]);
   assert.match((await runIssueLoop({ ...options, githubEvidenceFetch: undefined })).next_action, /different approved inputs/);
   assert.match((await runIssueLoop({ ...options, approval: { ...options.approval, githubPullRequest: 43 } })).next_action,
     /different approved inputs/);
@@ -279,6 +292,7 @@ test('binds GitHub API evidence to the issue claim and persists compact simulate
   const replay = await runIssueLoop(options);
   assert.equal(replay.status, 'BLOCKED');
   assert.match(replay.next_action, /candidate head/);
+  assert.equal(replay.checks.at(-1).classification, 'STALE');
   assert.equal(calls.length, 4);
 });
 
@@ -328,7 +342,7 @@ test('failed CI and unresolved Codex P1 findings enter the existing repair path'
       const prompts = [];
       options.providers.coding.run = (input) => {
         prompts.push(input);
-        return input.cycle === 0 ? pass({ revision: candidate(0) }) : { status: 'GATE_A' };
+        return input.cycle === 0 ? pass({ ...input, revision: candidate(0) }) : boundResult(input, 'GATE_A');
       };
       githubFixture(options, ({ run, pr, review, thread }) => {
         if (failure === 'ci') run.conclusion = 'failure';
@@ -364,6 +378,188 @@ test('a resolved Codex finding does not supply approval on its own', async (t) =
   assert.equal(report.status, 'BLOCKED');
   assert.match(report.next_action, /no verifiable approval/);
   assert.equal(report.repair_cycles, 0);
+});
+
+test('repairs only open P1 and P2 findings and invalidates evidence when coding returns a new SHA', async (t) => {
+  const options = await fixture(t);
+  let head = candidate(0);
+  const prompts = [];
+  codexFixture(options, ({ args }) => {
+    prompts.push(JSON.parse(args.at(-1)));
+    return successfulCodexChild();
+  });
+  const coding = options.providers.coding.run;
+  options.providers.coding.run = (input) => {
+    const output = coding(input);
+    head = output.revision;
+    return output;
+  };
+  githubFixture(options, ({ pr, review, thread }) => {
+    review.commit.oid = candidate(0);
+    review.state = 'COMMENTED';
+    if (head !== candidate(0)) return;
+    for (const [number, severity, resolved] of [[1, 'P1', false], [2, 'P2', false], [3, 'P3', false], [4, 'P2', true]]) {
+      const finding = structuredClone(thread);
+      finding.id = `PRRT_${number}`;
+      finding.isResolved = resolved;
+      const [root] = finding.comments.nodes;
+      root.id = `PRRC_${number}`;
+      root.body = root.body.replaceAll('P1', severity);
+      pr.reviewThreads.nodes.push(finding);
+    }
+  }, () => head);
+  const report = await runIssueLoop(options);
+  assert.equal(report.status, 'BLOCKED');
+  assert.equal(report.revision, candidate(1));
+  assert.equal(report.repair_cycles, 1);
+  assert.equal(prompts.length, 2);
+  const request = prompts[1];
+  assert.equal(request.baseRevision, candidate(0));
+  assert.equal(request.issueKey, options.profile.issue_key);
+  assert.equal(request.approvalDigest, options.approval.profileDigest);
+  assert.deepEqual(request.memoryScope, options.profile.memory_scope);
+  assert.deepEqual(request.findings.map(({ id }) => id), ['PRRC_1', 'PRRC_2']);
+  const [original, stale] = report.checks.filter(({ stage }) => stage === 'review');
+  assert.equal(original.classification, 'FAILED');
+  assert.equal(original.evidence.state, 'COMMENTED');
+  assert.equal(stale.classification, 'STALE');
+  assert.deepEqual(stale.findings, []);
+  assert.deepEqual(stale.evidence.prior_reviews, [{ id: 'PRR_1', sha: candidate(0) }]);
+  const claim = report.feedback.find(({ event }) => event === 'REPAIR_CLAIM');
+  assert.equal(claim.candidate_sha, candidate(0));
+  assert.deepEqual(claim.findings, [{ stage: 'review', id: 'PRRC_1' }, { stage: 'review', id: 'PRRC_2' }]);
+  const handoff = report.feedback.filter(({ event }) => event === 'CANDIDATE_HANDOFF').at(-1);
+  assert.deepEqual([handoff.candidate_sha, handoff.invalidated_sha], [candidate(1), candidate(0)]);
+  assert.ok(!JSON.stringify(report).includes('Fixture finding'));
+  await runIssueLoop(options);
+  assert.equal(prompts.length, 2);
+});
+
+test('a head change during a failing CI read prevents any repair', async (t) => {
+  const options = await fixture(t);
+  let head = candidate(0);
+  githubFixture(options, ({ path, run }) => {
+    if (path.endsWith('/check-runs')) {
+      run.conclusion = 'failure';
+      head = candidate(1);
+    }
+  }, () => head);
+  options.providers.coding.run = (input) => {
+    assert.equal(input.cycle, 0);
+    return pass({ ...input, revision: candidate(0) });
+  };
+  const report = await runIssueLoop(options);
+  assert.equal(report.status, 'BLOCKED');
+  assert.equal(report.attempts.length, 1);
+  const stale = report.checks.at(-1);
+  assert.equal(stale.classification, 'STALE');
+  assert.equal(stale.evidence.observed_head_sha, candidate(1));
+  assert.deepEqual(stale.findings, []);
+  assert.ok(!report.feedback.some(({ event }) => event === 'REPAIR_CLAIM'));
+});
+
+test('coding and verification reject invalid approval-binding fields independently', async (t) => {
+  const mismatches = {
+    issueKey: 'F2-99', linearIssueId: 'another-linear-id', repository: 'other/factory',
+    approvalDigest: 'a'.repeat(64),
+    memoryScope: { short_term: 'issue', long_term: 'project/module', allow_customer_data: true },
+  };
+  for (const stage of ['coding', 'ci']) {
+    for (const [field, mismatch] of Object.entries(mismatches)) {
+      await t.test(`${stage} requires ${field}`, async (t) => {
+        for (const [kind, value] of [
+          ['missing'], ['null', null], ['empty', field === 'memoryScope' ? {} : ''],
+          ['wrong type', 123], ['mismatched', mismatch],
+        ]) {
+          await t.test(kind, async (t) => {
+            const options = await fixture(t);
+            options.profile.linear_issue_id = options.evidence.linear.id = 'approved-linear-id';
+            options.approval.profileDigest = issueProfileDigest(options.profile);
+            let dispatches = 0;
+            const coding = options.providers.coding.run;
+            options.providers.coding.run = (input) => {
+              dispatches += 1;
+              const result = coding(input);
+              return stage === 'coding' ? invalid(result) : result;
+            };
+            options.providers.ci.run = (input) => invalid(failure(input, check));
+            const report = await runIssueLoop(options);
+            assert.equal(report.status, 'BLOCKED');
+            assert.equal(report.reason_code, 'INVALID_PROVIDER_BINDING');
+            assert.equal(report.feedback.at(-1).reason_code, report.reason_code);
+            assert.equal(report.repair_cycles, 0);
+            assert.equal(dispatches, 1);
+            if (stage === 'coding') {
+              assert.equal(report.revision, null);
+              assert.deepEqual(report.checks, []);
+            } else {
+              assert.equal(report.revision, candidate(0));
+              assert.equal(report.checks.at(-1).stage, 'ci');
+              assert.equal(report.checks.at(-1).reason_code, report.reason_code);
+              assert.deepEqual(report.checks.at(-1).findings, []);
+            }
+            assert.ok(!report.feedback.some(({ event }) => event === 'REPAIR_CLAIM'));
+
+            function invalid(result) {
+              if (kind === 'missing') delete result[field];
+              else result[field] = value;
+              return result;
+            }
+          });
+        }
+      });
+    }
+  }
+});
+
+test('cached review for the same SHA is rejected under a different approval', async (t) => {
+  const original = await fixture(t);
+  let cachedReview;
+  original.providers.review.run = (input) => {
+    cachedReview = pass(input);
+    return cachedReview;
+  };
+  assert.equal((await runIssueLoop(original)).status, 'READY');
+  const options = await fixture(t);
+  options.profile.requirements.push('Different approved scope');
+  options.approval.profileDigest = issueProfileDigest(options.profile);
+  options.providers.review.run = ({ revision }) => {
+    assert.equal(cachedReview.revision, revision);
+    return cachedReview;
+  };
+  const report = await runIssueLoop(options);
+  assert.equal(report.status, 'BLOCKED');
+  assert.equal(report.reason_code, 'INVALID_PROVIDER_BINDING');
+  assert.equal(report.checks.at(-1).stage, 'review');
+  assert.equal(report.repair_cycles, 0);
+  assert.ok(!JSON.stringify(report).includes(cachedReview.approvalDigest));
+});
+
+test('replay blocks claims written before provider bindings were required', async (t) => {
+  for (const github of [false, true]) {
+    await t.test(github ? 'GitHub refresh' : 'stored READY', async (t) => {
+      const options = await fixture(t);
+      let failing = false;
+      const calls = github ? githubFixture(options, ({ run }) => { if (failing) run.conclusion = 'failure'; }) : [];
+      const ready = await runIssueLoop(options);
+      assert.equal(ready.status, 'READY');
+      const statePath = join(options.stateDirectory, ready.run_id, 'state.json');
+      const state = JSON.parse(await readFile(statePath, 'utf8'));
+      delete state.providerBindingVersion;
+      await writeFile(statePath, JSON.stringify(state));
+      const readCount = calls.length;
+      failing = true;
+      let dispatches = 0;
+      options.providers.coding.run = () => { dispatches += 1; };
+      const replayed = await runIssueLoop(options);
+      assert.equal(replayed.status, 'BLOCKED');
+      assert.equal(replayed.reason_code, 'UNVERIFIED_STORED_BINDING');
+      assert.equal(replayed.feedback.at(-1).reason_code, replayed.reason_code);
+      assert.equal(dispatches, 0);
+      assert.equal(calls.length, readCount);
+      assert.deepEqual(JSON.parse(await readFile(statePath, 'utf8')), state);
+    });
+  }
 });
 
 test('an unavailable Actions login blocks live evidence without relabeling it as simulated', async (t) => {
@@ -469,7 +665,7 @@ test('refreshed CI failures and Codex P1 findings resume the next authorized rep
       options.providers.coding.run = (input) => {
         prompts.push(input);
         head = candidate(input.cycle);
-        return pass({ revision: head });
+        return pass({ ...input, revision: head });
       };
       options.providers.tests.run = (input) => { tested.push(input.revision); return pass(input); };
 
@@ -511,7 +707,7 @@ test('replay revalidates the execution envelope before dispatching a repair', as
       });
       assert.equal((await runIssueLoop(options)).status, 'BLOCKED');
       let dispatches = 0;
-      options.providers.coding.run = () => { dispatches += 1; return pass({ revision: candidate(1) }); };
+      options.providers.coding.run = (input) => { dispatches += 1; return pass({ ...input, revision: candidate(1) }); };
       if (boundary === 'preflight') options.evidence = {};
       if (boundary === 'provider') options.providers.coding.mode = 'LIVE';
       if (boundary === 'memory approval') options.profile.memory_scope.allow_customer_data = true;
@@ -547,14 +743,14 @@ test('a previous replay that persisted FAIL rechecks GitHub before resuming', as
   let prompt;
   options.providers.coding.run = (input) => {
     prompt = input;
-    return { status: 'GATE_A' };
+    return boundResult(input, 'GATE_A');
   };
   const gate = await runIssueLoop(options);
   assert.equal(gate.status, 'GATE_A');
   assert.equal(gate.repair_cycles, 1);
   assert.equal(prompt.cycle, 1);
   assert.deepEqual(prompt.findings.map(({ id }) => id), [check]);
-  assert.equal(calls.length, 8);
+  assert.equal(calls.length, 9);
 });
 
 test('concurrent replay acknowledges a durable repair claim and dispatches it once', async (t) => {
@@ -569,14 +765,15 @@ test('concurrent replay acknowledges a durable repair claim and dispatches it on
     run.status = pending ? 'queued' : 'completed';
     run.conclusion = pending ? null : 'failure';
   }, () => head);
-  options.providers.coding.run = async ({ cycle }) => {
+  options.providers.coding.run = async (input) => {
+    const { cycle } = input;
     prompts.push(cycle);
     if (cycle === 1) {
       entered.resolve();
       await release.promise;
     }
     head = candidate(cycle);
-    return pass({ revision: head });
+    return pass({ ...input, revision: head });
   };
   const original = await runIssueLoop(options);
   assert.equal(original.status, 'BLOCKED');
@@ -612,10 +809,11 @@ test('a refreshed failure at the third repair raises Gate A without another disp
     run.status = waiting ? 'queued' : 'completed';
     run.conclusion = waiting ? null : 'failure';
   }, () => head);
-  options.providers.coding.run = ({ cycle }) => {
+  options.providers.coding.run = (input) => {
+    const { cycle } = input;
     cycles.push(cycle);
     head = candidate(cycle);
-    return pass({ revision: head });
+    return pass({ ...input, revision: head });
   };
   const blocked = await runIssueLoop(options);
   assert.equal(blocked.status, 'BLOCKED');
@@ -648,7 +846,7 @@ test('replay preserves preflight, execution, security and SHA mismatch decisions
       const originalEvidence = options.evidence;
       if (kind === 'preflight') options.evidence = {};
       if (kind === 'execution') options.providers.tests.run = () => { throw new Error('test runner failed'); };
-      if (kind === 'security') options.providers.tests.run = ({ revision }) => ({ status: 'GATE_A', revision });
+      if (kind === 'security') options.providers.tests.run = (input) => boundResult(input, 'GATE_A');
 
       const original = await runIssueLoop(options);
       assert.equal(original.status, kind === 'security' ? 'GATE_A' : 'BLOCKED');
@@ -767,7 +965,16 @@ test('cancelling CI or review refresh preserves the durable report and permits a
       const after = JSON.parse(await readFile(statePath, 'utf8'));
       assert.equal(after.githubRefreshStartedAt, now);
       assert.equal(after.fingerprint, before.fingerprint);
-      assert.deepEqual(after.report, before.report);
+      const { feedback: audit, ...preserved } = after.report;
+      const { feedback: originalAudit, ...original } = before.report;
+      assert.deepEqual(preserved, original);
+      assert.deepEqual(audit.slice(0, originalAudit.length), originalAudit);
+      assert.equal(audit.at(-1).status, 'BLOCKED');
+      assert.match(audit.at(-1).reason, /execution cancelled/);
+      if (stage === 'review') {
+        assert.equal(audit.at(-2).stage, 'ci');
+        assert.equal(audit.at(-2).classification, 'CLEAN');
+      }
       const readsAfterCancel = calls.length;
       assert.equal((await runIssueLoop(options)).status, 'BLOCKED');
       assert.equal(calls.length, readsAfterCancel);
@@ -835,6 +1042,108 @@ test('retry after a cancelled refresh blocks invalid, stale, or unauthorized evi
   }
 });
 
+test('cancelling initial verification resumes the recorded SHA without coding again', async (t) => {
+  const options = await fixture(t);
+  const controller = new AbortController();
+  const checking = Promise.withResolvers();
+  let waiting = true;
+  let dispatches = 0;
+  codexFixture(options, () => { dispatches += 1; return successfulCodexChild(); });
+  githubFixture(options, ({ path }) => {
+    if (waiting && path === '/graphql') {
+      checking.resolve();
+      return new Promise(() => {});
+    }
+  });
+  const initial = runIssueLoop({ ...options, signal: controller.signal });
+  await checking.promise;
+  controller.abort();
+  const cancelled = await initial;
+  assert.equal(cancelled.status, 'BLOCKED');
+  assert.equal(cancelled.verification_pending, true);
+  assert.equal(cancelled.revision, candidate(0));
+  assert.deepEqual(cancelled.checks.map(({ stage }) => stage), ['tests', 'ci']);
+  assert.equal(cancelled.attempts[0].dispatch.candidate_revision, candidate(0));
+  assert.match(cancelled.feedback.at(-1).reason, /cancelled/);
+  waiting = false;
+  const resumed = await runIssueLoop(options);
+  assert.equal(resumed.status, 'READY');
+  assert.equal(resumed.revision, candidate(0));
+  assert.equal(resumed.verification_pending, undefined);
+  assert.equal(resumed.attempts.length, 1);
+  assert.equal(dispatches, 1);
+  assert.deepEqual(resumed.feedback.slice(0, cancelled.feedback.length), cancelled.feedback);
+  assert.equal(resumed.feedback[cancelled.feedback.length].event, 'VERIFICATION_RESUMED');
+});
+
+test('cancellation recovery rejects a same-SHA failure missing an approval binding', async (t) => {
+  const options = await fixture(t);
+  const controller = new AbortController();
+  const checking = Promise.withResolvers();
+  let codingCalls = 0;
+  const coding = options.providers.coding.run;
+  options.providers.coding.run = (input) => { codingCalls += 1; return coding(input); };
+  options.providers.ci.run = () => {
+    checking.resolve();
+    return new Promise(() => {});
+  };
+  const running = runIssueLoop({ ...options, signal: controller.signal });
+  await checking.promise;
+  controller.abort();
+  const cancelled = await running;
+  assert.equal(cancelled.verification_pending, true);
+
+  options.providers.ci.run = (input) => {
+    assert.equal(input.revision, cancelled.revision);
+    const result = failure(input, check);
+    delete result.linearIssueId;
+    return result;
+  };
+  const resumed = await runIssueLoop(options);
+  assert.equal(resumed.status, 'BLOCKED');
+  assert.equal(resumed.reason_code, 'INVALID_PROVIDER_BINDING');
+  assert.equal(resumed.repair_cycles, 0);
+  assert.equal(codingCalls, 1);
+  assert.deepEqual(await runIssueLoop(options), resumed);
+  assert.equal(codingCalls, 1);
+});
+
+test('a process exit preserves candidate and check evidence for verification-only recovery', async (t) => {
+  const options = await fixture(t);
+  const childScript = `
+    const { runIssueLoop } = await import(process.argv[1]);
+    const options = JSON.parse(process.argv[2]);
+    const provider = (kind, principal, run) => ({ mode: 'SIMULATION', kind, principal, run });
+    const pass = ({ issueKey, linearIssueId, repository, approvalDigest, memoryScope, revision }) =>
+      ({ issueKey, linearIssueId, repository, approvalDigest, memoryScope, revision, status: 'PASS' });
+    options.providers = {
+      coding: { ...provider('agent', 'coder', (input) => pass({ ...input, revision: process.argv[3] })), profile: options.profile.role_profile },
+      tests: provider('deterministic', 'node', pass),
+      ci: provider('read-only', 'ci', () => process.exit(75)),
+      review: provider('agent', 'reviewer', (input) => pass(input)),
+    };
+    await runIssueLoop(options);
+  `;
+  const child = spawn(process.execPath, ['--input-type=module', '--eval', childScript,
+    new URL('./issue-loop.mjs', import.meta.url).href, JSON.stringify(options), candidate(0)], { stdio: 'ignore' });
+  assert.deepEqual(await once(child, 'exit'), [75, null]);
+
+  options.providers.coding.run = () => assert.fail('known candidate must never be redispatched');
+  const interrupted = await runIssueLoop(options);
+  assert.equal(interrupted.status, 'BLOCKED');
+  assert.match(interrupted.next_action, /active or interrupted/);
+  assert.equal(interrupted.revision, candidate(0));
+  assert.deepEqual(interrupted.checks.map(({ stage, status }) => [stage, status]), [['tests', 'PASS']]);
+  // The child is confirmed dead, so the abandoned lock can be reconciled.
+  await rmdir(join(options.stateDirectory, interrupted.run_id, 'github-refresh'));
+  const resumed = await runIssueLoop(options);
+  assert.equal(resumed.status, 'READY');
+  assert.equal(resumed.revision, candidate(0));
+  assert.equal(resumed.attempts.length, 1);
+  assert.ok(resumed.feedback.some(({ event }) => event === 'VERIFICATION_RESUMED'));
+  assert.equal(resumed.feedback.filter(({ event }) => event === 'DISPATCH_CLAIM').length, 1);
+});
+
 test('runs targeted test, CI and independent review repairs and replays persisted evidence', async (t) => {
   const options = await fixture(t);
   const prompts = [];
@@ -843,7 +1152,7 @@ test('runs targeted test, CI and independent review repairs and replays persiste
     prompts.push(input);
     return coding(input);
   };
-  options.providers.tests.run = ({ revision }) => revision === candidate(0) ? failure(revision, 'T01') : pass({ revision });
+  options.providers.tests.run = (input) => input.revision === candidate(0) ? failure(input, 'T01') : pass(input);
   let reads = 0;
   options.providers.ci.run = (input, { signal }) => inspectGitHubChecks({
     ...input, signal,
@@ -858,7 +1167,7 @@ test('runs targeted test, CI and independent review repairs and replays persiste
       }] }));
     },
   });
-  options.providers.review.run = ({ revision }) => revision === candidate(2) ? failure(revision, 'task.mjs:12') : pass({ revision });
+  options.providers.review.run = (input) => input.revision === candidate(2) ? failure(input, 'task.mjs:12') : pass(input);
 
   const report = await runIssueLoop(options);
   assert.equal(report.status, 'READY');
@@ -875,13 +1184,15 @@ test('runs targeted test, CI and independent review repairs and replays persiste
   assert.equal(reads, 4);
   assert.deepEqual(await runIssueLoop({ ...options, providers: {}, evidence: {} }), report);
   assert.equal(prompts.length, 4);
-  assert.ok(JSON.stringify(report).length < 4096);
+  const { feedback, ...summary } = report;
+  assert.ok(JSON.stringify(summary).length < 4096);
+  assert.equal(feedback.filter(({ event }) => event === 'REPAIR_CLAIM').length, 3);
   assert.ok(!JSON.stringify(report).includes('Fix the failing assertion'));
 });
 
 test('Gate A requires three unsuccessful repairs after the initial attempt', async (t) => {
   const options = await fixture(t);
-  options.providers.tests.run = ({ revision }) => failure(revision, 'T01');
+  options.providers.tests.run = (input) => failure(input, 'T01');
   const report = await runIssueLoop(options);
   assert.equal(report.status, 'GATE_A');
   assert.equal(report.owner_gate, 'A');
@@ -895,9 +1206,9 @@ test('an unavailable, mismatched or pending CI provider cannot trigger a repair'
     await t.test(`${status} ${foreign ? 'foreign SHA' : 'same SHA'}`, async (t) => {
       const options = await fixture(t);
       let calls = 0;
-      options.providers.ci.run = ({ revision }) => {
+      options.providers.ci.run = (input) => {
         calls += 1;
-        return { status, revision: foreign ? baseline : revision };
+        return boundResult({ ...input, revision: foreign ? baseline : input.revision }, status);
       };
       options.providers.review.run = () => assert.fail('review before CI passes');
       const report = await runIssueLoop(options);
@@ -913,11 +1224,12 @@ test('a concurrent claim and an interrupted claim never dispatch twice', async (
   const started = Promise.withResolvers();
   const release = Promise.withResolvers();
   let calls = 0;
-  options.providers.coding.run = async ({ cycle }) => {
+  options.providers.coding.run = async (input) => {
+    const { cycle } = input;
     calls += 1;
     started.resolve();
     await release.promise;
-    return { status: 'PASS', revision: candidate(cycle) };
+    return pass({ ...input, revision: candidate(cycle) });
   };
   const active = runIssueLoop(options);
   await started.promise;
@@ -993,9 +1305,9 @@ test('coding receives the explicitly approved customer-data policy', async (t) =
   const { short_term, long_term } = options.profile.memory_scope;
   options.profile.memory_scope = { allow_customer_data: true, long_term, short_term };
   let suppliedScope;
-  options.providers.coding.run = ({ memoryScope }) => {
-    suppliedScope = memoryScope;
-    return { status: 'PASS', revision: candidate(0) };
+  options.providers.coding.run = (input) => {
+    suppliedScope = input.memoryScope;
+    return pass({ ...input, revision: candidate(0) });
   };
 
   assert.equal((await runIssueLoop(options)).status, 'READY');
@@ -1004,7 +1316,7 @@ test('coding receives the explicitly approved customer-data policy', async (t) =
 
 test('an explicit provider boundary stops at Gate A without a retry', async (t) => {
   const options = await fixture(t);
-  options.providers.review.run = ({ revision }) => ({ status: 'GATE_A', revision });
+  options.providers.review.run = (input) => boundResult(input, 'GATE_A');
   const report = await runIssueLoop(options);
   assert.equal(report.status, 'GATE_A');
   assert.equal(report.repair_cycles, 0);

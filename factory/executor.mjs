@@ -85,7 +85,7 @@ export async function executeRepairCycles({ performAttempt, beforeAttempt, recor
   let findings = previousFailure?.findings ?? [];
   const nextCycle = previousFailure ? previousFailure.cycle + 1 : 0;
   for (let cycle = nextCycle; cycle <= MAX_REPAIR_CYCLES; cycle += 1) {
-    const stopped = await beforeAttempt(cycle);
+    const stopped = await beforeAttempt(cycle, findings);
     if (stopped) return stopped;
     const outcome = await performAttempt({ cycle, findings });
     await recordAttempt(cycle, outcome);

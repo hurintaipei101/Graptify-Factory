@@ -40,8 +40,11 @@ function ghRead(execCommand, endpoint) {
 function defaultGh(args, callback) { execFile('gh', args, { encoding: 'utf8', windowsHide: true }, callback); }
 
 /** Read the latest exact-revision GitHub check runs without AI or write access. */
-export async function inspectGitHubChecks({ repository, revision, requiredChecks, signal, execCommand, read } = {}) {
-  const result = (status, extras) => ({ revision, status, ...extras });
+export async function inspectGitHubChecks({
+  issueKey, linearIssueId, repository, approvalDigest, memoryScope, revision, requiredChecks, signal, execCommand, read,
+} = {}) {
+  const binding = issueKey === undefined ? {} : { issueKey, linearIssueId, repository, approvalDigest, memoryScope };
+  const result = (status, extras) => ({ ...binding, revision, status, ...extras });
   if (typeof repository !== 'string' || !/^[\w.-]+\/[\w.-]+$/.test(repository) ||
       repository.split('/').some((part) => part === '.' || part === '..') ||
       typeof revision !== 'string' || !/^[0-9a-f]{40}$/.test(revision) ||
@@ -72,7 +75,9 @@ export async function inspectGitHubChecks({ repository, revision, requiredChecks
       missing.push(name);
       continue;
     }
-    if (check.head_sha !== revision) return result('BLOCKED', { reason: 'GitHub check run is for a different SHA' });
+    if (check.head_sha !== revision) return result('BLOCKED', {
+      reason: 'GitHub check run is for a different SHA', classification: 'STALE',
+    });
     if (read && (!hasGitHubActionsProvenance(check, repository) || checks.some(({ id }) => id === check.id))) {
       return result('BLOCKED', { reason: 'required check run has unverified GitHub Actions provenance' });
     }
@@ -86,7 +91,9 @@ export async function inspectGitHubChecks({ repository, revision, requiredChecks
     }
     if (read) {
       if (!isFreshGitHubTimestamp(check.completed_at, nowMs)) {
-        return result('BLOCKED', { reason: 'required GitHub check has a stale or invalid completion time' });
+        return result('BLOCKED', {
+          reason: 'required GitHub check has a stale or invalid completion time', classification: 'STALE',
+        });
       }
       checks.push({ id: check.id, name, conclusion: check.conclusion, completed_at: check.completed_at });
     }
